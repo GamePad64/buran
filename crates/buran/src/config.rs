@@ -163,7 +163,6 @@ pub struct Config {
     pub provider: Option<ProviderConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub skills_dirs: Vec<PathBuf>,
-    pub bundled_fs_server: bool,
     pub permission: PermissionPolicy,
     /// How long `session/request_permission` waits for the client before
     /// denying (Ask policy). Not user-configurable in v1.
@@ -284,7 +283,6 @@ impl Config {
             provider,
             mcp_servers,
             skills_dirs,
-            bundled_fs_server: true,
             permission,
             permission_timeout: std::time::Duration::from_secs(120),
         })

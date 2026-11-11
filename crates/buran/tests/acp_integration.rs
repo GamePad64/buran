@@ -67,14 +67,13 @@ fn body_contains(req: &hclient::mock::RecordedRequest, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Test config: the injected provider, no MCP servers, no bundled fs,
-/// Ask policy. Skills dirs passed per-test.
+/// Test config: the injected provider, no MCP servers, Ask policy. Skills
+/// dirs passed per-test.
 fn test_config(skills_dirs: Vec<std::path::PathBuf>) -> buran::config::Config {
     buran::config::Config {
         provider: Some(provider()),
         mcp_servers: Vec::new(),
         skills_dirs,
-        bundled_fs_server: false,
         permission: buran::config::PermissionPolicy::Ask,
         permission_timeout: Duration::from_secs(2),
     }

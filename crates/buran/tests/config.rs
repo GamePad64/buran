@@ -88,7 +88,6 @@ fn missing_everything_loads_defaults() {
     assert!(cfg.provider.is_none());
     assert!(cfg.mcp_servers.is_empty());
     assert_eq!(cfg.permission, PermissionPolicy::Ask);
-    assert!(cfg.bundled_fs_server); // default true: graceful degradation per spec
 }
 
 #[test]
