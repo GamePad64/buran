@@ -42,7 +42,7 @@ api_key = "sk-..."                        # or leave unset and export BURAN_API_
 model = "gpt-4o-mini"
 
 # Optional: permission policy for MCP tool calls (default "ask")
-[permission]
+[permissions]
 policy = "ask"        # allow_all | deny_all | ask
 
 # Optional: extra skill directories
@@ -82,7 +82,7 @@ Project instructions, read automatically (the way Claude Code reads CLAUDE.md). 
 
 ### ACT — the recommended tool layer
 
-On first run, `buran doctor` detects an empty MCP configuration and offers **ACT** (MCP-over-stdio) as the ready-made tool set — including its filesystem component, which is the way buran gets file tools (there is no bundled fs server; all tools are external, by design). Accepting the offer writes the config line; the harness itself has no ACT-specific code.
+On first run, `buran doctor` detects an empty MCP configuration and offers **ACT** (MCP-over-stdio) as the ready-made tool set — including its filesystem component, which is the way buran gets file tools (there is no bundled fs server; all tools are external, by design). The offer prints the ready-to-paste config line; the harness itself has no ACT-specific code.
 
 ## ACP contract
 
