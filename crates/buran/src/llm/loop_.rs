@@ -121,6 +121,10 @@ pub struct AgentLoop {
     /// Wire name `server__tool` → MCP qualified `server/tool`.
     tool_map: BTreeMap<String, String>,
     max_turns: u32,
+    /// Scanned skill descriptions; `<skill>Name</skill>` at the head of
+    /// the turn's first assistant message loads the matching body
+    /// (ADR 0004 — zero tools, the model just writes the tag).
+    skills: Vec<crate::skills::SkillDescription>,
 }
 
 impl AgentLoop {
@@ -132,7 +136,14 @@ impl AgentLoop {
             tool_defs: Vec::new(),
             tool_map: BTreeMap::new(),
             max_turns: 32,
+            skills: Vec::new(),
         }
+    }
+
+    /// Registers the skills loadable via the `<skill>` tag convention.
+    pub fn with_skills(mut self, skills: Vec<crate::skills::SkillDescription>) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// Sets the tool catalog offered to the model: every tool becomes
@@ -182,6 +193,9 @@ impl AgentLoop {
 
         let mut tool_calls_made: u32 = 0;
         let mut finish = FinishReason::Stop;
+        // `<skill>` detection applies to the turn's first assistant
+        // message only (ADR 0004).
+        let mut first_assistant_message = true;
 
         for _round in 0..self.max_turns {
             if *cancel.borrow_and_update() {
@@ -217,6 +231,18 @@ impl AgentLoop {
             }
 
             if requested.is_empty() {
+                // Skill-tag convention: `<skill>Name</skill>` at the head
+                // of the turn's first assistant message injects the body
+                // and continues the turn; the tag text itself stays in the
+                // transcript and the stream (ADR 0004).
+                if first_assistant_message {
+                    first_assistant_message = false;
+                    if let Some(skill_message) = self.skill_continuation(&assistant_text) {
+                        session.history.push(ChatMessage::assistant(assistant_text));
+                        session.history.push(skill_message);
+                        continue;
+                    }
+                }
                 session.history.push(ChatMessage::assistant(assistant_text));
                 finish = round_finish.unwrap_or(FinishReason::Stop);
                 let _ = events.send(TurnEvent::TurnDone(finish)).await;
@@ -292,6 +318,29 @@ impl AgentLoop {
             finish,
             tool_calls_made,
         })
+    }
+
+    /// If `assistant_text` begins with `<skill>Name</skill>` naming a
+    /// registered skill, returns the system-role message carrying the
+    /// skill body for the continuation round. Any I/O failure degrades to
+    /// no continuation (the turn just ends).
+    fn skill_continuation(&self, assistant_text: &str) -> Option<ChatMessage> {
+        let rest = assistant_text.strip_prefix("<skill>")?;
+        let (name, remainder) = rest.split_once("</skill>")?;
+        if name.is_empty() {
+            return None;
+        }
+        let skill = self.skills.iter().find(|s| s.name == name)?;
+        let body = crate::skills::load_body(skill).ok()?;
+        let mut message = String::from("The user loaded the skill `");
+        message.push_str(name);
+        message.push_str("`. Follow its instructions:\n\n");
+        message.push_str(&body.body_markdown);
+        if !remainder.is_empty() {
+            message.push_str("\n\nThe rest of your message was: ");
+            message.push_str(remainder);
+        }
+        Some(ChatMessage::system(message))
     }
 
     /// Streams one LLM round: text deltas out as events, tool-call fragments

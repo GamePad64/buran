@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod agentsmd;
 pub mod config;
 pub mod llm;

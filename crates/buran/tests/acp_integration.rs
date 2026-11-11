@@ -1,0 +1,414 @@
+//! ACP server integration: in-process client ↔ agent over the SDK's
+//! builder-to-builder connection (no real transport), plus a child-process
+//! stdout purity smoke test for `buran serve`.
+//!
+//! The LLM is `hclient-mock`; no real HTTP server is ever spawned.
+//!
+//! Session lifecycle note: `on_session_start` spawns its callback, and the
+//! connection shuts down when main_fn returns — the callback may be killed
+//! mid-flight. All tests therefore use the blocking form
+//! (`build_session(..)?.block_task().start_session().await?`), which holds
+//! main_fn open for the whole session and fails the test if the session
+//! doesn't complete.
+
+use std::time::Duration;
+
+use agent_client_protocol::{
+    Client, JsonRpcMessage as _,
+    v1::schema::StopReason,
+    v1::{SessionMessage, SessionSetup, schema::SessionNotification, schema::SessionUpdate},
+};
+use buran::config::{ApiKey, ProviderConfig};
+use buran::llm::LlmClient;
+use hclient::mock::MockTransport;
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+fn provider() -> ProviderConfig {
+    ProviderConfig {
+        name: "test-provider".into(),
+        base_url: "http://mock.test/v1".into(),
+        model: "test-model".into(),
+        api_key: ApiKey::Explicit("sk-test".into()),
+    }
+}
+
+fn sse(frames: Vec<&'static str>) -> http::Response<Vec<&'static str>> {
+    http::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .body(frames)
+        .unwrap()
+}
+
+fn text_chunk(text: &str) -> String {
+    format!(r#"{{"choices":[{{"delta":{{"content":"{text}"}}}}]}}"#)
+}
+
+fn stop_and_done() -> String {
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()
+}
+
+/// SSE body: two text deltas, finish_reason stop, [DONE].
+fn hello_body() -> String {
+    format!(
+        "data: {}\n\ndata: {}\n\n{}",
+        text_chunk("Hello"),
+        text_chunk(" from buran"),
+        stop_and_done()
+    )
+}
+
+/// The request body as text, for assertions.
+fn body_contains(req: &hclient::mock::RecordedRequest, needle: &str) -> bool {
+    req.body
+        .text()
+        .map(|text| text.contains(needle))
+        .unwrap_or(false)
+}
+
+/// Test config: the injected provider, no MCP servers, no bundled fs,
+/// Ask policy. Skills dirs passed per-test.
+fn test_config(skills_dirs: Vec<std::path::PathBuf>) -> buran::config::Config {
+    buran::config::Config {
+        provider: Some(provider()),
+        mcp_servers: Vec::new(),
+        skills_dirs,
+        bundled_fs_server: false,
+        permission: buran::config::PermissionPolicy::Ask,
+    }
+}
+
+/// One session notification's update, if it is one.
+fn as_notification(message: SessionMessage) -> Option<SessionNotification> {
+    let SessionMessage::Message(dispatch) = message else {
+        return None;
+    };
+    let untyped = dispatch.to_untyped_message().ok()?;
+    SessionNotification::parse_message(untyped.method(), untyped.params()).ok()
+}
+
+/// Send the ACP `initialize` handshake. The SDK rejects `session/new`
+/// until initialization completes.
+async fn initialize(
+    cx: &agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Agent>,
+) -> Result<(), agent_client_protocol::Error> {
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::v1::schema::InitializeRequest;
+    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
+        .await?;
+    Ok(())
+}
+
+/// Full round trip: initialize → newSession → prompt streams text deltas
+/// and ends with EndTurn.
+#[tokio::test(flavor = "current_thread")]
+async fn initialize_new_session_prompt_streams_and_ends() {
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(hello_body().into_boxed_str())]));
+    let m2 = m.clone();
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        let text = session.read_to_string().await?;
+        assert_eq!(text, "Hello from buran");
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
+/// The prompt response must carry EndTurn after a natural stop. Driven via
+/// `read_update` so the PromptResponse itself is observed, not just text.
+#[tokio::test(flavor = "current_thread")]
+async fn prompt_response_carries_end_turn() {
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(hello_body().into_boxed_str())]));
+    let m2 = m.clone();
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        loop {
+            if let SessionMessage::PromptResponse(resp) = session.read_update().await? {
+                let resp = resp.expect("prompt response ok");
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
+/// The system prompt must reach the LLM request: AGENTS.md instructions
+/// from the session cwd become the system message of the outgoing chat
+/// request.
+#[tokio::test(flavor = "current_thread")]
+async fn system_prompt_built_from_agentsmd() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("AGENTS.md"),
+        "# Instructions\nBe terse.\n",
+    )
+    .unwrap();
+
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(hello_body().into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m3.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let cwd = workspace.path().to_path_buf();
+    let client = Client.v1().connect_with(agent, async move |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session(cwd).block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        let text = session.read_to_string().await?;
+        assert_eq!(text, "Hello from buran");
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+
+    // One LLM request must carry the AGENTS.md text as system content.
+    let requests = m2.requests();
+    assert_eq!(requests.len(), 1, "exactly one LLM request");
+    assert!(
+        body_contains(&requests[0], "Be terse."),
+        "system prompt must contain AGENTS.md instructions"
+    );
+}
+
+/// Tool calls surface to the client as ToolCall/ToolCallUpdate
+/// notifications: turn 1 requests `fs__read`, turn 2 answers. A stub tool
+/// caller answers with fixed output (no MCP servers configured).
+#[tokio::test(flavor = "current_thread")]
+async fn tool_call_streams_tool_call_updates() {
+    let m = MockTransport::new();
+    let turn1 = format!(
+        "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c1\",\"function\":{{\"name\":\"fs__read\",\"arguments\":\"{{}}\"}}}}]}}}},{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+        text_chunk("")
+    );
+    let turn2 = format!("data: {}\n\n{}", text_chunk("read done"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("read it")?;
+        let mut saw_tool_call = false;
+        loop {
+            let message = session.read_update().await?;
+            if let SessionMessage::PromptResponse(resp) = message {
+                let resp = resp.expect("prompt response ok");
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+                break;
+            } else if let Some(SessionUpdate::ToolCall(tool_call)) =
+                as_notification(message).map(|n| n.update)
+            {
+                assert_eq!(tool_call.name.as_deref(), Some("fs__read"));
+                saw_tool_call = true;
+            }
+        }
+        assert!(saw_tool_call, "must have seen a ToolCall update");
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
+/// First-run `<skill>` detection: the model's first assistant message
+/// begins with `<skill>Name</skill>`, the skill body is injected, and the
+/// turn continues to the real answer.
+#[tokio::test(flavor = "current_thread")]
+async fn skill_tag_in_first_message_loads_body() {
+    let workspace = tempfile::tempdir().unwrap();
+    let skills_dir = workspace.path().join("skills");
+    std::fs::create_dir_all(skills_dir.join("greet")).unwrap();
+    std::fs::write(
+        skills_dir.join("greet/SKILL.md"),
+        "---\nname: greet\ndescription: how to greet\n---\nSAY HELLO LOUDLY.\n",
+    )
+    .unwrap();
+
+    let m = MockTransport::new();
+    // Turn 1: the model asks for the skill.
+    let turn1 = format!(
+        "data: {}\n\n{}",
+        text_chunk("<skill>greet</skill>"),
+        stop_and_done()
+    );
+    // Turn 2: after injection, the model answers.
+    let turn2 = format!("data: {}\n\n{}", text_chunk("HELLO!"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+
+    let skills = skills_dir.clone();
+    let agent =
+        buran::acp::agent_builder_with_config(test_config(vec![skills]), move |_provider| {
+            Ok(LlmClient::with_transport(
+                provider(),
+                hclient::Client::builder(m3.clone()).build().unwrap(),
+            ))
+        })
+        .await
+        .expect("agent builder");
+
+    let cwd = workspace.path().to_path_buf();
+    let client = Client.v1().connect_with(agent, async move |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session(cwd).block_task().start_session().await?;
+        session.send_prompt("use the skill")?;
+        let text = session.read_to_string().await?;
+        assert_eq!(text, "<skill>greet</skill>HELLO!");
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+
+    // Turn 2's request must carry the injected skill body as a system
+    // message.
+    let requests = m2.requests();
+    assert_eq!(requests.len(), 2, "two LLM rounds");
+    assert!(
+        body_contains(&requests[1], "SAY HELLO LOUDLY."),
+        "skill body must be injected into the continuation request"
+    );
+}
+
+/// Smoke test: `buran serve` speaks newline-delimited JSON-RPC on stdout —
+/// one parse-error response for garbage in, nothing else on stdout (logs
+/// go to stderr).
+#[test]
+fn serve_child_stdout_purity() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let bin = env!("CARGO_BIN_EXE_buran");
+    let mut child = Command::new(bin)
+        .arg("serve")
+        .env("HOME", "/nonexistent-buran-home")
+        .env_remove("BURAN_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn buran serve");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "not json at all").unwrap();
+        stdin.flush().unwrap();
+    }
+    drop(child.stdin.take());
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut got = String::new();
+    // Read available lines in a thread so we can honor the deadline.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    got.push_str(&line);
+                    if line.contains("protocolVersion") || line.contains("error") {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(got.clone());
+    });
+
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let text = rx.recv_timeout(remaining).unwrap_or_else(|_| {
+        let _ = child.kill();
+        String::new()
+    });
+    let _ = handle.join();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if text.trim().is_empty() {
+        // Server exited without answering (acceptable: malformed line may
+        // terminate connection) — nothing non-JSON was printed.
+        return;
+    }
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("stdout line not JSON: {line:?} ({e})"));
+    }
+}
