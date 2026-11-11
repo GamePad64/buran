@@ -1,115 +1,137 @@
 # AGENTS.md — buran
 
-_Лёгковесный агентский харнесс на Rust в стиле Pi: ACP-агент + MCP-инструменты, один бинарник, ноль встроенных тулов._
+_Lightweight agent harness in Rust, in the style of Pi: an ACP agent with MCP tools. One binary, zero built-in tools._
 
-## Что это за проект
+## What this project is
 
-**buran** (`cargo bin`: `buran`, короткая команда `bu`) — headless ACP-сервер агента с отдельной TUI-плашкой. Один процесс = одна сессия. Назван в честь «Бурана» (15.11.1988 — первый корабль, взлетевший, выполнивший миссию и севший полностью автономно).
+**buran** (cargo bin: `buran`, short command `bu`) is a headless ACP agent server with a separate TUI binary. One process = one session. Named after the Buran shuttle (15.11.1988 — the first spacecraft to launch, complete its mission, and land fully autonomously).
 
-Проект стартует с нуля — **в репо пока нет кода**. Твоя задача: построить MVP по спеке ниже. Спека выстраданная, дизайн-раунды закрыты; не пересматривай архитектурные решения, помеченные «FIXED» — они согласованы с владельцем.
+The project starts from zero — **the repo currently has no code**. Your task: build the MVP to the spec below. The spec is settled through design rounds; do not revisit architectural decisions marked "FIXED" — they are agreed with the owner.
 
-## Философия (читать до старта)
+## Philosophy (read before starting)
 
-1. **Минимализм в стиле Pi.** Никаких встроенных инструментов агента. Всё снаружи, через MCP. Если функция можно выразить конфигом или MCP-сервером — она не попадает в код харнесса.
-2. **Один бинарник, ноль рантайм-зависимостей.** Пользователь ставит один файл — и всё работает. Никаких node/python для базовой работы.
-3. **Провайдеры — конфиг, не код.** Только OpenAI-compatible endpoints. Разница между провайдерами — `base_url`, `api_key`, имя модели. Никаких per-provider плагинов.
-4. **WASM-плагины — нет (v1).** MCP-over-stdio уже является кросс-языковой системой плагинов. wasmtime добавил бы десятки мегабайт и противоречил цели «один бинарник».
+1. **Minimalism in the style of Pi.** No built-in agent tools. Everything is external, via MCP. If a feature can be expressed as config or an MCP server, it does not go into harness code.
+2. **One binary, zero runtime dependencies.** The user installs one file and everything works. No node/python needed for basic operation.
+3. **Providers are config, not code.** OpenAI-compatible endpoints only. The difference between providers is `base_url`, `api_key`, and a model name. No per-provider plugins.
+4. **WASM plugins — no (v1).** MCP-over-stdio is already a cross-language plugin system. wasmtime would add tens of megabytes and contradict the "one binary" goal.
 
-## Архитектура (FIXED — не пересматривать)
+## Architecture (FIXED — do not revisit)
 
-Три уровня, каждый со своим владельцем:
+Three layers, each with its own owner:
 
-| Уровень | Протокол | Что делает |
+| Layer | Protocol | Role |
 |---|---|---|
-| Инструменты/данные | **MCP** (JSON-RPC, stdio) | агенты ↔ тулы. Любые тулы — только MCP-серверы, включая ACT |
-| Клиент ↔ агент | **ACP** (agent-client-protocol, stdio) | редактор/клиент ↔ агент: сессии, стрим `session/update`, запросы разрешений |
-| Агент ↔ агент (v3) | **A2A** | сетевая федерация, скрытые внутренности |
+| Tools/data | **MCP** (JSON-RPC, stdio) | agents ↔ tools. All tools are MCP servers, including ACT |
+| Client ↔ agent | **ACP** (agent-client-protocol, stdio) | editor/client ↔ agent: sessions, streamed `session/update`, permission requests |
+| Agent ↔ agent (v3) | **A2A** | network federation, hides internals |
 
-Ключевое правило ACP: клиент может вызвать только `initialize / newSession / loadSession / prompt / stop / setSessionMode / setSessionModel`. Инструмент на агенте клиент вызвать не может — двигает агента только `prompt`. Файловая система, терминал, permissions — на стороне **клиента** (`fs/read_text_file`, `fs/write_text_file`, `terminal/create`, `session/request_permission`); LLM-цикл и исполнение tool-calls — на стороне **агента**.
+Key ACP rule: the client may call only `initialize / newSession / loadSession / prompt / stop / setSessionMode / setSessionModel`. The client cannot invoke a tool on the agent — only `prompt` moves it. Filesystem, terminal, permissions live on the **client** side (`fs/read_text_file`, `fs/write_text_file`, `terminal/create`, `session/request_permission`); the LLM loop and tool-call execution live on the **agent** side.
 
-## Обязательные поверхности (FIXED — минимум MVP)
+## Required surfaces (FIXED — MVP minimum)
 
-1. **AGENTS.md** — инструкции проекта, читаются харнессом автоматически (как Claude Code читает CLAUDE.md). Формат совместим с гейтвейным AGENTS.md; CLAUDE.md — симлинк.
-2. **`.mcp.json`** — конфиг MCP-серверов проекта (де-факто стандарт формата).
-3. **Skills**: `SKILL.md` с frontmatter (`name`, `description`) — описания инжектятся в системный промпт, тело подгружается по релевантности. Формат совместим с OpenClaw/Anthropic skill-creator. Нативно + skills-over-MCP (удалённые источники скиллов подключаются как MCP).
-4. **ACT как рекомендуемый дефолт**: в docs и first-run flow рекомендовать ACT (MCP-over-stdio) как готовый слой инструментов. **В коде — ни одной ветки про ACT.**
+1. **AGENTS.md** — project instructions, read automatically by the harness (the way Claude Code reads CLAUDE.md). Format compatible with the gateway-style AGENTS.md; CLAUDE.md is a symlink.
+2. **`.mcp.json`** — project MCP server config (the de-facto standard format).
+3. **Skills**: `SKILL.md` with frontmatter (`name`, `description`) — descriptions are injected into the system prompt, the body is loaded on relevance. Format compatible with OpenClaw/Anthropic skill-creator. Native + skills-over-MCP (remote skill sources plug in as MCP).
+4. **ACT as the recommended default**: docs and the first-run flow recommend ACT (MCP-over-stdio) as the ready-made tool layer. **Not a single code branch about ACT.**
 
-## Скоуп MVP
+## HTTP client: hclient (FIXED)
 
-Реализовать:
+All HTTP in buran goes through **hclient** — the owner's own cross-platform async HTTP client workspace (`https://github.com/GamePad64/hclient`, published pre-release on crates.io). Do **not** pull in `reqwest` or any other HTTP stack.
 
-1. **`buran serve`** — headless ACP-сервер (stdio): `initialize`, `newSession`, `prompt`, `stop`, стрим `session/update`, permission-запросы наружу.
-2. **LLM-цикл**: OpenAI-compatible endpoint (base_url + api_key + model из конфига), стриминг, tool-call loop против подключённых MCP-серверов.
-3. **MCP-клиент**: спавн stdio-серверов из `.mcp.json`, tools/list → tools/call. Использовать `rmcp` (официальный Rust MCP SDK).
-4. **Конфиг**: провайдеры + MCP-серверы + скиллы (глобальный `~/.config/buran/config.toml` + проектный `.buran/` или общий проектный формат — реши по ходу, главное — проектные MCP-серверы читаются из `.mcp.json`).
-5. **Skills loader**: сканирует локальные директории скиллов, парсит frontmatter, инжектит описания, отдаёт тело по запросу.
-6. **`buran tui`** — отдельный бинарник (или feature), TUI-клиент поверх ACP: ratatui. Минимум: сессия, стрим текста, approve/deny permission. TUI — отдельная витрина, не часть `serve`.
-7. **First-run doctor**: на старте проверить MCP-серверы из конфига; ни одного — предложить ACT как дефолтный набор инструментов (интерактивно, без кодовой ветки).
-8. **Graceful degradation ACP**: если клиент в `initialize` не объявил fs/terminal-капабилити — агент обязан откатиться на bundled filesystem MCP-сервер (включается одной строчкой конфига) или честно потерять файловые инструменты, не падая.
+- Dependency: `hclient` with `default-features = false`, enable exactly what you need:
+  - `default-transport` (native: tokio + rustls + system resolver) — this is what buran wants; `Client::new()` requires the feature flag and an ambient tokio runtime.
+  - `default-http2` if needed for SSE-heavy endpoints later.
+- The LLM provider call is a plain `POST /chat/completions` with `stream: true` returning SSE. Use **`hclient::sse::{SseStream, SseEvent}`** — hclient ships its own SSE decoding with MIME-token-boundary checking; do not hand-roll an SSE parser.
+- Tests use **`hclient-mock`** (`MockTransport::new()`, `push_response`, `push_response_frames`, `push_response_frames_then_error`) — this is the workspace's own mock, built for exactly this. For LLM streaming tests, push frame responses through `MockTransport` rather than running a real HTTP server. Do **not** add `wiremock` or spawn test HTTP servers: hclient's architecture makes in-process mock transports the intended seam.
+- hclient is sans-io at the core with swappable transport/TLS/resolver/runtime seams. buran is a plain native consumer: `Client::new()` + `default-transport` is the whole story. Do not pick transports manually.
 
-Явно **не** в MVP: субагенты (v2 — см. ниже), A2A (v3), WASM-плагины (отклонено), компакция контекста (см. Open questions), A2A-обнаружение.
+## MVP scope
 
-## Крейты (не тянуть лишнего)
+Implement:
 
-- `agent-client-protocol` (Zed) — ACP-типы и JSON-RPC-обвязка.
+1. **`buran serve`** (bin `buran`) — headless ACP server (stdio): `initialize`, `newSession`, `prompt`, `stop`, streamed `session/update`, permission requests out.
+2. **`buran-tui`** (separate bin, e.g. `bu-tui` or feature-gated second binary) — TUI client over ACP: ratatui + crossterm. Minimum: session, text stream, approve/deny permission. The TUI is a separate showcase binary, not part of `serve`; the ACP stdio contract between the two binaries is the seam.
+3. **LLM loop**: OpenAI-compatible endpoint (base_url + api_key + model from config), streaming via hclient SSE, tool-call loop against connected MCP servers.
+4. **MCP client**: spawn stdio servers from `.mcp.json`, `tools/list` → `tools/call`. Use `rmcp` (the official Rust MCP SDK).
+5. **Config**: providers + MCP servers + skills (global `~/.config/buran/config.toml` + project-level; project MCP servers are read from `.mcp.json`).
+6. **Skills loader**: scans local skill directories, parses frontmatter, injects descriptions, serves bodies on demand.
+7. **First-run doctor**: on startup, probe configured MCP servers; if none, offer ACT as the default tool set (interactively, no code branch).
+8. **ACP graceful degradation**: if the client does not declare fs/terminal capabilities in `initialize`, the agent must fall back to a bundled filesystem MCP server (enabled by one config line) or honestly lose filesystem tools without crashing.
+
+Explicitly **not** in MVP: subagents (v2, below), A2A (v3), WASM plugins (rejected), context compaction (see Open questions), A2A discovery.
+
+## Crates (do not drag in extras)
+
+- `agent-client-protocol` (Zed) — ACP types and JSON-RPC plumbing.
 - `rmcp` — MCP SDK.
-- HTTP/SSE для OpenAI-compatible — лёгкий клиент поверх `reqwest` + `eventsource-stream` (или `reqwest-eventsource`), не тянуть тяжёлые SDK.
-- `tokio` + `serde`/`serde_json` — рантайм и конфиги.
-- `ratatui` + `crossterm` — только в TUI-бинарнике (feature или отдельный bin, чтобы `buran serve` не тащил их).
-- `tracing` + `tracing-subscriber` — логи в файл/stderr, не в stdio ACP-канал (!).
+- **`hclient`** (+ `hclient-mock` as dev-dependency) — all HTTP and SSE. No reqwest, no other HTTP stack, no hand-rolled SSE.
+- `tokio` + `serde`/`serde_json` — runtime and configs.
+- `ratatui` + `crossterm` — only in the TUI binary (separate bin or feature, so `buran serve` does not carry them).
+- `tracing` + `tracing-subscriber` — logs to file/stderr, never into the ACP stdio channel (!).
 
-**Запрет**: никаких wasmtime/extism в v1; никаких provider-specific SDK (openai, anthropic crates).
+**Forbidden**: wasmtime/extism in v1; provider-specific SDKs (openai, anthropic crates); reqwest or any HTTP client other than hclient.
 
-## Тестирование
+## Toolchain / MSRV
 
-- Юнит-тесты: парсинг config/AGENTS.md/.mcp.json/SKILL.md frontmatter, LLM-цикл на mock-сервере (wiremock), MCP handshake против mock stdio-процесса.
-- Интеграционный тест ACP: поднять `buran serve` как child process, прогнать initialize → newSession → prompt с mock-LLM (тестовый OpenAI-compatible сервер на wiremock), проверить стрим `session/update`.
-- `cargo clippy -- -D warnings` и `cargo fmt --check` должны проходить. CI: GitHub Actions, rust stable + beta, кэш cargo.
+- Edition 2024.
+- **MSRV policy: "the latest stable release"** — do not pin a version number. Use a `rust-toolchain.toml` with `channel = "stable"` and `components = ["rustfmt", "clippy"]` (the hclient workspace does exactly this; copy the pattern). No `rust-version = "x.y"` floor in Cargo.toml beyond what the compiler needs, and no MSRV CI job — the policy itself is the statement.
+- `cargo clippy -- -D warnings` and `cargo fmt --check` must pass.
 
-## Стиль кода
+## Testing
 
-- Rust 2021, `rust-toolchain.toml` с pinned stable.
-- Ошибки: `thiserror` для библиотечных типов, `anyhow` на границе main/CLI.
-- CLI: `clap` с derive. Подкоманды: `serve` (дефолт), `tui`, `doctor`, `mcp list`.
-- Комментарии и doc-comments — на английском; коммиты — conventional commits (`feat:`, `fix:`, `docs:`, `chore:`).
-- Логи: только в stderr/файл. **Никогда не писать в stdout при `serve`** — stdout занят ACP JSON-RPC.
+- Unit tests: parsing config/AGENTS.md/.mcp.json/SKILL.md frontmatter; LLM loop against **`hclient-mock`** `MockTransport` (queued SSE frame responses via `push_response_frames`); MCP handshake against a mock stdio process.
+- ACP integration test: spawn `buran serve` as a child process, drive initialize → newSession → prompt with `MockTransport`-backed LLM responses, assert the `session/update` stream.
+- Do not spawn real HTTP servers in tests; in-process mock transports are the seam hclient exposes for this.
+- CI: GitHub Actions, rust stable, cargo cache.
 
-## Open questions (можно решать самому, пометь ADR-заметками в `docs/adr/`)
+## Code style
 
-1. **Компакция контекста**: стратегия усечения длинных сессий (порог токенов? ручной `/compact`? summary-вызов LLM?). Для MVP достаточно ручного триггера.
-2. **Permission mapping**: как ACP `session/request_permission` мапится на confirm/deny для tool-calls MCP (per-server? per-tool? per-session flag?).
-3. **Расположение скиллов**: глобальная директория + проектная? Merge-стратегия?
-4. **Формат транскрипта сессий** (задел под v1.5, не блокер MVP): canonical JSONL (сообщения, tool-calls + результаты, метаданные модели, точки компакции) — это артефакт для resume/fork в будущем. Можно заложить типы сейчас, хранение — потом.
+- Rust 2024 edition, American English everywhere (code, comments, doc-comments, commit messages, README, docs).
+- Errors: `thiserror` for library types, `anyhow` at the main/CLI boundary.
+- CLI: `clap` with derive. Subcommands: `serve` (default), `tui`, `doctor`, `mcp list`.
+- Comments and doc-comments in American English; commits follow conventional commits (`feat:`, `fix:`, `docs:`, `chore:`).
+- Logs: stderr/file only. **Never write to stdout under `serve`** — stdout is the ACP JSON-RPC channel.
+- Match the hclient workspace's bar for comments: explain *why*, with the measurement or commit that backs it, rather than restating *what*.
 
-## Roadmap (для ориентира, MVP = v1)
+## Open questions (decide yourself, record as ADRs in `docs/adr/`)
 
-- **v1**: `serve` + TUI + MCP + AGENTS.md + skills + doctor (этот скоуп).
-- **v1.5**: sessions store (canonical JSONL) + `--resume` / `--fork` + ACP `loadSession`. Прецедент: OpenClaw продолжает сессии Claude Code через каталог сессий + fork-session.
-- **v2**: субагенты как bundled MCP-сервер `buran-subagents` (spawn/send/wait; родитель — ACP-клиент свежих child-процессов; глубина ≤ 2; результат — финальный текст в tool-result).
-- **v3**: CTO-оркестрация поверх воркеров: `ssh host -- buran serve` (stdio-туннель сохраняет ACP-предположение), воркер внутри периметра своей машины (свой fs/свои MCP), координатор получает отчёты, а не креды. A2A (AgentCard, opaque tasks) — только когда воркеров станет много/разнородных.
+1. **Context compaction**: strategy for trimming long sessions (token threshold? manual `/compact`? summary LLM call?). For MVP a manual trigger is enough.
+2. **Permission mapping**: how ACP `session/request_permission` maps to confirm/deny for MCP tool-calls (per-server? per-tool? per-session flag?).
+3. **Skills locations**: global directory + project directory? Merge strategy?
+4. **Session transcript format** (preparation for v1.5, not an MVP blocker): canonical JSONL (messages, tool-calls + results, model metadata, compaction points) — the artifact for future resume/fork. Types can be laid down now; storage can wait.
 
-## Верификация готовности MVP (Definition of Done)
+## Roadmap (for orientation; MVP = v1)
 
-- [ ] `cargo build --release` даёт единый бинарник, работает на свежей машине без рантайм-зависимостей.
-- [ ] `buran serve` проходит handshake с `agent-client-protocol`-тестом (или Zed, если под рукой).
-- [ ] `buran tui` ведёт сессию против `buran serve` end-to-end: стрим текста, один tool-call через MCP, один approve/deny.
-- [ ] `.mcp.json` с одним сервером (например, `npx @modelcontextprotocol/server-filesystem`) подхватывается и тул доступен модели.
-- [ ] AGENTS.md проекта инжектится в системный промпт.
-- [ ] SKILL.md-скилл из директории скиллов виден по описанию, тело подгружается.
-- [ ] Doctor без настроенных MCP-серверов предлагает ACT (конфиг-строка, не код).
-- [ ] Клиент без fs-капабилити не валит сервер (fallbackbundled fs-сервер по конфигу).
-- [ ] CI зелёный: fmt, clippy, тесты.
+- **v1**: `serve` + TUI + MCP + AGENTS.md + skills + doctor (this scope).
+- **v1.5**: sessions store (canonical JSONL) + `--resume` / `--fork` + ACP `loadSession`. Precedent: OpenClaw continues Claude Code sessions via the session catalog + fork-session.
+- **v2**: subagents as a bundled MCP server `buran-subagents` (spawn/send/wait; the parent acts as an ACP client to fresh child processes; depth ≤ 2; the result is the final text in a tool-result).
+- **v3**: CTO orchestration over workers: `ssh host -- buran serve` (the stdio tunnel preserves ACP's stdio assumption), the worker lives inside its machine's perimeter (its own fs/its own MCP), the coordinator receives reports, not credentials. A2A (AgentCard, opaque tasks) only when workers become numerous/heterogeneous.
 
-## Не делать
+## MVP Definition of Done
 
-- Не добавлять встроенные tool-имплементации в бинарник (кроме fallback bundled fs-сервера из п.8 Graceful degradation — он тоже MCP-сервер, просто поставляется в комплекте).
-- Не вводить per-provider логику в код (только конфиг).
-- Не тащить wasmtime/extism/тяжёлые SDK.
-- Не писать в stdout из `serve`.
-- Не блокировать stdio-потоки sync I/O в tokio-контексте (использовать `tokio::io` или spawn_blocking для child-process stdin/stdout).
+- [ ] `cargo build --release` yields the binaries; they work on a fresh machine without runtime dependencies.
+- [ ] `buran serve` completes the handshake with an `agent-client-protocol` test client (or Zed, if available).
+- [ ] The TUI binary drives a session against `buran serve` end-to-end: streamed text, one tool-call through MCP, one approve/deny.
+- [ ] `.mcp.json` with one server (e.g. `npx @modelcontextprotocol/server-filesystem`) is picked up and the tool is available to the model.
+- [ ] The project's AGENTS.md is injected into the system prompt.
+- [ ] A SKILL.md skill from a skills directory is visible by description; the body loads on demand.
+- [ ] Doctor with no configured MCP servers offers ACT (a config line, not code).
+- [ ] A client without fs capability does not crash the server (bundled fs-server fallback per config).
+- [ ] LLM streaming goes through hclient's `SseStream` (no hand-rolled SSE), tests use `hclient-mock`.
+- [ ] CI green: fmt, clippy, tests.
 
-## Репозиторий
+## Do not
 
-- GitHub: `GamePad64/buran` (main, пустой на момент старта).
-- Лицензия: MIT (владелец подтвердил ранее для харнесса; добавить файл LICENSE).
-- Владелец: @GamePad64 (Александр). Архитектурные вопросы — фиксированы выше; сомнения — оформляй ADR-черновик в `docs/adr/NNNN-title.md` и продолжай по наиболее разумному варианту, помечая открытый вопрос в конце файла.
+- Do not add built-in tool implementations to the binary (except the fallback bundled fs server from "ACP graceful degradation" — and that one is also an MCP server, just bundled).
+- Do not introduce per-provider logic in code (config only).
+- Do not drag in wasmtime/extism/heavy SDKs.
+- Do not use any HTTP client other than hclient; do not hand-roll SSE parsing.
+- Do not write to stdout from `serve`.
+- Do not block stdio flows with sync I/O inside the tokio context (use `tokio::io` or `spawn_blocking` for child-process stdin/stdout).
+- Do not pin a toolchain version (MSRV policy: latest stable).
+
+## Repository
+
+- GitHub: `GamePad64/buran` (main, empty at start).
+- License: MIT (the owner confirmed this earlier for the harness; add the LICENSE file).
+- Owner: @GamePad64 (Alexander). Architectural questions are fixed above; for doubts, draft an ADR in `docs/adr/NNNN-title.md` and proceed with the most reasonable option, marking the open question at the end of the file.
