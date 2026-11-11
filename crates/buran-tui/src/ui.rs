@@ -154,9 +154,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let lines = transcript_lines(app);
-    // `u16::MAX` pins the view to the bottom (ratatui clamps the offset);
-    // a manual scroll uses the stored value.
-    let offset = app.scroll.unwrap_or(u16::MAX);
+    // Follow mode (no manual scroll): offset = lines - height, so the last
+    // line sits at the pane bottom. NOT `u16::MAX` — ratatui 0.30 with
+    // `Wrap` walks `next_line()` per offset row and early-returns once past
+    // the content, so an oversized offset renders an EMPTY pane (the bug
+    // this fixes: the transcript never appeared). Clamping to the real
+    // count keeps follow mode correct for any content size.
+    let line_count = lines.len().min(u16::MAX as usize) as u16;
+    let offset = app.scroll.unwrap_or(line_count.saturating_sub(area.height));
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((offset, 0));
