@@ -7,5 +7,9 @@
 mod manager;
 mod registry;
 
-pub use manager::{McpError, McpManager};
+pub use manager::{McpError, McpManager, ToolOutput};
 pub use registry::{ToolCatalog, ToolEntry};
+
+/// Re-exported so consumers (tests, ACP server) can build `ToolEntry`s
+/// without depending on rmcp directly.
+pub use rmcp::model::Tool as McpTool;

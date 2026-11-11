@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use hclient::sse::{DEFAULT_MAX_EVENT_SIZE, SseEvent, SseStream};
 
 use super::types::{ApiErrorBody, ChatChunk, ChatRequest, FinishReason};
-use crate::config::{ApiKey, ProviderConfig};
+use crate::config::ProviderConfig;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -141,11 +141,16 @@ impl LlmClient {
         Self { client, provider }
     }
 
-    fn api_key(&self) -> &str {
-        match &self.provider.api_key {
-            ApiKey::Explicit(key) => key,
-            ApiKey::FromEnv(name) => name,
-        }
+    fn api_key(&self) -> String {
+        // FromEnv stores the variable's NAME; resolve reads the process env.
+        // A missing variable yields an empty key: the API answers 401 with
+        // its own message, which surfaces through LlmError::Api.
+        self.provider.api_key.resolve().unwrap_or_default()
+    }
+
+    /// The model name from the provider config; requests carry it.
+    pub fn model_name(&self) -> &str {
+        &self.provider.model
     }
 
     /// POSTs the request and returns the live SSE stream.
@@ -161,7 +166,7 @@ impl LlmClient {
         let resp = self
             .client
             .post(url)
-            .bearer_auth(self.api_key())
+            .bearer_auth(&self.api_key())
             .json(req)
             .send()
             .await?;
