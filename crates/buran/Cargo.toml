@@ -1,0 +1,27 @@
+[package]
+name = "buran"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightweight ACP agent harness: one binary, zero built-in tools, everything via MCP"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hclient = { version = "0.1.0-alpha.20", features = ["default-transport", "json"] }
+agent-client-protocol = { version = "5", features = ["stdio"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "macros", "transport-child-process"] }
+
+[dev-dependencies]
+hclient = { version = "0.1.0-alpha.20", features = ["test-util", "json"] }
+futures = "0.3"
+http = "1"
+tempfile = "3"

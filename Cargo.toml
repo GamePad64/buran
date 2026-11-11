@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/buran", "crates/buran-tui"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/GamePad64/buran"
+
+[workspace.dependencies]
+buran = { path = "crates/buran" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

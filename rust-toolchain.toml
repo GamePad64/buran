@@ -1,0 +1,9 @@
+# The MSRV policy is "the latest stable release" (AGENTS.md, Toolchain), so the
+# toolchain this repository builds with is not a pinned version — it is
+# whatever stable is today. Declaring it here means `cargo` picks it up via
+# rustup without anyone having to remember. There is deliberately no version
+# pinned here and no MSRV job anywhere: the policy IS "the latest stable", so
+# a pin would be a second, staler statement of the same promise.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
