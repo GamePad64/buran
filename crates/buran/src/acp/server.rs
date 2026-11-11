@@ -256,20 +256,34 @@ async fn run_prompt_turn(
     let message_id = MessageIdClock::start();
 
     // Event pump: TurnEvents → session/update notifications; permission
-    // queries are answered by the config policy (Task 10: ACP round-trip).
+    // queries follow the config policy — Ask round-trips the client (in
+    // this spawned task, never on the dispatch loop), AllowAll/DenyAll
+    // decide locally.
     let policy = state.config.permission;
+    let permission_timeout = state.config.permission_timeout;
     let conn2 = conn.clone();
     let pump = tokio::spawn(async move {
         while let Some(event) = events_rx.recv().await {
             match event {
-                TurnEvent::PermissionQuery(_) => {
+                TurnEvent::PermissionQuery(query) => {
                     let decision = match policy {
                         PermissionPolicy::AllowAll => PermissionDecision::Allow,
-                        PermissionPolicy::DenyAll | PermissionPolicy::Ask => {
-                            PermissionDecision::Deny
+                        PermissionPolicy::DenyAll => PermissionDecision::Deny,
+                        PermissionPolicy::Ask => {
+                            super::request_permission(
+                                &conn2,
+                                &session_id,
+                                ToolCallId::new(query.call_id),
+                                &query.tool,
+                                &format!("{}/{}", query.server, query.tool),
+                                permission_timeout,
+                            )
+                            .await
                         }
                     };
-                    let _ = perm_tx.send(decision).await;
+                    if perm_tx.send(decision).await.is_err() {
+                        break;
+                    }
                 }
                 TurnEvent::TextDelta(delta) => {
                     let notification = SessionNotification::new(

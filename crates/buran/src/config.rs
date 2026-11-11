@@ -165,6 +165,9 @@ pub struct Config {
     pub skills_dirs: Vec<PathBuf>,
     pub bundled_fs_server: bool,
     pub permission: PermissionPolicy,
+    /// How long `session/request_permission` waits for the client before
+    /// denying (Ask policy). Not user-configurable in v1.
+    pub permission_timeout: std::time::Duration,
 }
 
 /// Serialized `[provider]` / top-level shape of a config file.
@@ -283,6 +286,7 @@ impl Config {
             skills_dirs,
             bundled_fs_server: true,
             permission,
+            permission_timeout: std::time::Duration::from_secs(120),
         })
     }
 }

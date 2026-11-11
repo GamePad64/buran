@@ -76,6 +76,7 @@ fn test_config(skills_dirs: Vec<std::path::PathBuf>) -> buran::config::Config {
         skills_dirs,
         bundled_fs_server: false,
         permission: buran::config::PermissionPolicy::Ask,
+        permission_timeout: Duration::from_secs(2),
     }
 }
 
@@ -338,6 +339,278 @@ async fn skill_tag_in_first_message_loads_body() {
     assert!(
         body_contains(&requests[1], "SAY HELLO LOUDLY."),
         "skill body must be injected into the continuation request"
+    );
+}
+
+/// SSE body for turn 1 asking for the `fs__read` tool.
+fn tool_call_body() -> String {
+    format!(
+        "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c1\",\"function\":{{\"name\":\"fs__read\",\"arguments\":\"{{}}\"}}}}]}}}},{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+        text_chunk("")
+    )
+}
+
+/// Ask policy round-trip, allow path: the test client answers the agent's
+/// `session/request_permission` with the `allow` option (matched by KIND,
+/// never position), the tool runs, and the tool output notification flows
+/// back before the final text.
+#[tokio::test(flavor = "current_thread")]
+async fn ask_policy_allow_runs_tool_and_streams_output() {
+    use agent_client_protocol::on_receive_request;
+    use agent_client_protocol::v1::schema::{
+        PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, SelectedPermissionOutcome, ToolCallStatus,
+    };
+
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(tool_call_body().into_boxed_str())]));
+    let turn2 = format!(
+        "data: {}\n\n{}",
+        text_chunk("file is empty"),
+        stop_and_done()
+    );
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+
+    let mut config = test_config(Vec::new());
+    config.permission = buran::config::PermissionPolicy::Ask;
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m3.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client
+        .v1()
+        .on_receive_request(
+            async |request: RequestPermissionRequest, responder, _cx| {
+                // Answer by KIND, never position (yolo example rule):
+                // prefer the narrowest allow.
+                let allow_id = [
+                    PermissionOptionKind::AllowOnce,
+                    PermissionOptionKind::AllowAlways,
+                ]
+                .iter()
+                .find_map(|kind| {
+                    request
+                        .options
+                        .iter()
+                        .find(|option| option.kind == *kind)
+                        .map(|option| option.option_id.clone())
+                })
+                .expect("buran must offer an allow option");
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(allow_id)),
+                ))
+            },
+            on_receive_request!(),
+        )
+        .connect_with(agent, async |cx| {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } =
+                cx.build_session_cwd()?.block_task().start_session().await?;
+            session.send_prompt("read it")?;
+            let mut saw_tool_finish = false;
+            loop {
+                let message = session.read_update().await?;
+                if let SessionMessage::PromptResponse(resp) = message {
+                    let resp = resp.expect("prompt response ok");
+                    assert_eq!(resp.stop_reason, StopReason::EndTurn);
+                    break;
+                } else if let Some(SessionUpdate::ToolCallUpdate(update)) =
+                    as_notification(message).map(|n| n.update)
+                {
+                    let finished = matches!(
+                        update.fields.status,
+                        Some(ToolCallStatus::Completed) | Some(ToolCallStatus::Failed)
+                    );
+                    if finished {
+                        saw_tool_finish = true;
+                    }
+                }
+            }
+            assert!(saw_tool_finish, "allowed tool must reach a final status");
+            Ok(())
+        });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+
+    // The tool ran: its result reached the model in round 2. No MCP
+    // servers are configured, so `fs__read` fails with a named error —
+    // the point is execution after allow, not the tool's success.
+    let requests = m2.requests();
+    assert_eq!(requests.len(), 2, "two LLM rounds");
+    assert!(
+        body_contains(&requests[1], "tool error"),
+        "allowed tool must execute and its result reach the model"
+    );
+}
+
+/// Ask policy round-trip, deny path: the client picks the reject option;
+/// the tool must not run (stub would panic) and the denial tool result
+/// reaches the model — turn 2's request body carries `denied by user`.
+#[tokio::test(flavor = "current_thread")]
+async fn ask_policy_deny_sends_denial_to_model() {
+    use agent_client_protocol::on_receive_request;
+    use agent_client_protocol::v1::schema::{
+        PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, SelectedPermissionOutcome,
+    };
+
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(tool_call_body().into_boxed_str())]));
+    let turn2 = format!("data: {}\n\n{}", text_chunk("understood"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+
+    let mut config = test_config(Vec::new());
+    config.permission = buran::config::PermissionPolicy::Ask;
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m3.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked_handler = asked.clone();
+    let client = Client
+        .v1()
+        .on_receive_request(
+            async |request: RequestPermissionRequest, responder, _cx| {
+                let reject_id = [
+                    PermissionOptionKind::RejectOnce,
+                    PermissionOptionKind::RejectAlways,
+                ]
+                .iter()
+                .find_map(|kind| {
+                    request
+                        .options
+                        .iter()
+                        .find(|option| option.kind == *kind)
+                        .map(|option| option.option_id.clone())
+                })
+                .expect("buran must offer a reject option");
+                asked_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(reject_id)),
+                ))
+            },
+            on_receive_request!(),
+        )
+        .connect_with(agent, async move |cx| {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } =
+                cx.build_session_cwd()?.block_task().start_session().await?;
+            session.send_prompt("read it")?;
+            let text = session.read_to_string().await?;
+            assert_eq!(text, "understood");
+            Ok(())
+        });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+
+    // The permission request must actually have gone over the wire: the
+    // client handler ran (Ask policy, not silent deny).
+    assert!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        "Ask policy must send session/request_permission to the client"
+    );
+
+    // The denial tool result must reach the model in round 2.
+    let requests = m2.requests();
+    assert_eq!(requests.len(), 2, "two LLM rounds");
+    assert!(
+        body_contains(&requests[1], "denied by user"),
+        "denial tool result must be in the continuation request"
+    );
+}
+
+/// `request_permission` timeout: a client that receives the request but
+/// never answers is Deny after `permission_timeout`. The handler parks
+/// forever (received-but-silent), so without the timeout the test would
+/// hang — the 100 ms budget turns silence into Deny and the turn proceeds.
+#[tokio::test(flavor = "current_thread")]
+async fn request_permission_timeout_is_deny() {
+    use agent_client_protocol::on_receive_request;
+    use agent_client_protocol::v1::schema::{
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    };
+
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(tool_call_body().into_boxed_str())]));
+    let turn2 = format!("data: {}\n\n{}", text_chunk("moved on"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+
+    let mut config = test_config(Vec::new());
+    config.permission = buran::config::PermissionPolicy::Ask;
+    config.permission_timeout = Duration::from_millis(100);
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m3.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    // Handler records the request and stalls 1 s before answering — far
+    // past buran's 100 ms budget, so the agent must have already timed
+    // out to Deny (a handler that parks forever would block the client's
+    // whole dispatch loop, since handlers run on it).
+    let got_request = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let got_request_handler = got_request.clone();
+    let client = Client
+        .v1()
+        .on_receive_request(
+            async |_request: RequestPermissionRequest, responder, _cx| {
+                got_request_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            on_receive_request!(),
+        )
+        .connect_with(agent, async |cx| {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } =
+                cx.build_session_cwd()?.block_task().start_session().await?;
+            session.send_prompt("read it")?;
+            let text = session.read_to_string().await?;
+            assert_eq!(text, "moved on");
+            Ok(())
+        });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+
+    assert!(
+        got_request.load(std::sync::atomic::Ordering::SeqCst),
+        "the permission request must have reached the silent client"
+    );
+    let requests = m2.requests();
+    assert_eq!(requests.len(), 2, "two LLM rounds after timeout denial");
+    assert!(
+        body_contains(&requests[1], "denied by user"),
+        "timeout denial must produce the denial tool result"
     );
 }
 
