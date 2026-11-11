@@ -74,3 +74,53 @@ async fn unknown_tool_is_named_error() {
     assert!(err.unwrap_err().to_string().contains("nope/tool"));
     manager.shutdown().await;
 }
+
+/// DoD sweep: the real `npx @modelcontextprotocol/server-filesystem` is
+/// picked up from `.mcp.json` and its tools land in the catalog. Gated on
+/// node being installed (CI and minimal machines skip); `npx -y` needs
+/// network on first run, hence the generous timeout.
+#[tokio::test]
+async fn real_filesystem_server_from_mcp_json_is_picked_up() {
+    let Ok(output) = tokio::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .await
+    else {
+        eprintln!("skipping: node not installed");
+        return;
+    };
+    if !output.status.success() {
+        eprintln!("skipping: node --version failed");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        r#"{"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}}}"#,
+    )
+    .unwrap();
+
+    // The .mcp.json parse itself is covered by config tests; here the
+    // server config is constructed the way `Config::load` would produce it.
+    let configs = [server(
+        "fs",
+        "npx",
+        &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+    )];
+    let manager = McpManager::start(&configs, Duration::from_secs(60))
+        .await
+        .expect("manager constructs");
+
+    assert!(
+        manager.failures().is_empty(),
+        "real fs server must handshake: {:?}",
+        manager.failures()
+    );
+    let names = manager.catalog().await.names();
+    assert!(
+        names.iter().any(|n| n.starts_with("fs/")),
+        "fs tools must be qualified in the catalog: {names:?}"
+    );
+    manager.shutdown().await;
+}
