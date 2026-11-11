@@ -14,6 +14,16 @@ use crate::config::McpServerConfig;
 /// One rmcp client session with a spawned MCP server process.
 pub type McpClient = RunningService<RoleClient, ()>;
 
+/// The source of a `tools/call` failure: an rmcp service error, or the
+/// manager's own request timeout.
+#[derive(Debug, thiserror::Error)]
+pub enum CallErrorSource {
+    #[error("{0}")]
+    Service(#[from] Box<rmcp::ServiceError>),
+    #[error("no response within {CALL_TIMEOUT:?}")]
+    TimedOut,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("failed to spawn MCP server {server}: {source}")]
@@ -34,7 +44,7 @@ pub enum McpError {
     #[error("calling {server} failed: {source}")]
     Call {
         server: String,
-        source: Box<rmcp::ServiceError>,
+        source: CallErrorSource,
     },
     #[error("unknown tool: {name}")]
     UnknownTool { name: String },
@@ -49,6 +59,15 @@ pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
 }
+
+/// Ceilings on post-handshake MCP requests: a server that handshakes fine
+/// and then wedges (slow npx spawn, dead network tool) must degrade to a
+/// per-server tool-error, never block the LLM loop forever. The plan's
+/// stated invariant. `tools/list` is metadata — healthy servers answer in
+/// milliseconds; `tools/call` may run legitimate long work, so it gets a
+/// wider bound.
+const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Spawned MCP servers plus a record of the ones that failed.
 ///
@@ -88,12 +107,13 @@ impl McpManager {
     }
 
     /// The catalog of all tools across all healthy servers, qualified by
-    /// server name: `"server-name/tool-name"`.
+    /// server name: `"server-name/tool-name"`. Bounded per server: a
+    /// silent server costs the catalog its timeout once, then drops out.
     pub async fn catalog(&self) -> ToolCatalog {
         let mut entries = Vec::new();
         for (server, client) in &self.clients {
-            match client.list_all_tools().await {
-                Ok(tools) => {
+            match tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await {
+                Ok(Ok(tools)) => {
                     for tool in tools {
                         entries.push(ToolEntry {
                             server: server.clone(),
@@ -101,8 +121,14 @@ impl McpManager {
                         });
                     }
                 }
-                Err(source) => {
+                Ok(Err(source)) => {
                     tracing::warn!(server = %server, %source, "tools/list failed");
+                }
+                Err(_) => {
+                    // The handshake succeeded but the server stopped
+                    // answering: degrade to zero tools from it rather
+                    // than freezing every future prompt.
+                    tracing::warn!(server = %server, "tools/list timed out");
                 }
             }
         }
@@ -114,6 +140,8 @@ impl McpManager {
     /// Tool results are text-joined; MCP `is_error` results come back as
     /// `ToolOutput { is_error: true }`, not as `Err` — a failed tool is
     /// model-visible content, the model decides what to do with it.
+    /// Bounded: a wedged server surfaces as a model-visible timeout error,
+    /// never blocks the turn.
     pub async fn call(
         &self,
         qualified: &str,
@@ -134,12 +162,17 @@ impl McpManager {
             serde_json::Value::Object(map) => map,
             _ => Default::default(),
         };
-        let result = client
-            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
+        let call = client
+            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments));
+        let result = tokio::time::timeout(CALL_TIMEOUT, call)
             .await
+            .map_err(|_| McpError::Call {
+                server: server.to_string(),
+                source: CallErrorSource::TimedOut,
+            })?
             .map_err(|source| McpError::Call {
                 server: server.to_string(),
-                source: Box::new(source),
+                source: CallErrorSource::Service(Box::new(source)),
             })?;
 
         let text = result

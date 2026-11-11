@@ -124,3 +124,61 @@ async fn real_filesystem_server_from_mcp_json_is_picked_up() {
     );
     manager.shutdown().await;
 }
+
+/// A server that completes the MCP handshake, then goes silent: every
+/// post-handshake request (`tools/list`, `tools/call`) hangs. The manager
+/// must bound both — the plan's invariant: `tools/list`/`tools/call` must
+/// time out and surface a per-server tool-error, never block the LLM loop.
+fn half_dead_server_script() -> String {
+    // rmcp sends numeric JSON-RPC ids; the id is echoed VERBATIM (no
+    // re-quoting — a string id would never correlate and the handshake
+    // would time out).
+    r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2026-07-28","capabilities":{},"serverInfo":{"name":"half-dead","version":"0"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      # Handshake passed; now hang forever (wedged network tool scenario).
+      sleep 300
+      ;;
+  esac
+done
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn tools_list_timeout_degrades_with_warning_failure() {
+    let manager = McpManager::start(
+        &[server("half", "bash", &["-c", &half_dead_server_script()])],
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("handshake succeeds: manager constructs");
+    assert!(
+        manager.failures().is_empty(),
+        "handshake passed, no startup failures: {:?}",
+        manager.failures()
+    );
+
+    // catalog() must return promptly (bounded by LIST_TIMEOUT + slack),
+    // with the silent server contributing nothing.
+    let started = std::time::Instant::now();
+    let catalog = tokio::time::timeout(Duration::from_secs(20), manager.catalog())
+        .await
+        .expect("catalog must not hang past the request timeout");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "catalog returned only after unbounded wait: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        catalog.names().is_empty(),
+        "silent server contributes no tools: {:?}",
+        catalog.names()
+    );
+    manager.shutdown().await;
+}
