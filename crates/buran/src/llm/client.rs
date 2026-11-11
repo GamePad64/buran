@@ -89,9 +89,12 @@ impl ChatStream {
                         if choice.finish_reason.is_some() {
                             self.last_finish_reason = choice.finish_reason;
                         }
-                        if let Some(content) = choice.delta.content.filter(|c| !c.is_empty()) {
-                            return Ok(Some(ChatEvent::Delta(content)));
-                        }
+                        // A chunk may carry BOTH text and tool-call
+                        // fragments (coalescing gateways do this): buffer
+                        // the tool fragments FIRST, then queue the text
+                        // behind them — an early `return` here would drop
+                        // the rest of the chunk (the silent-loss bug the
+                        // final review caught).
                         for tc in choice.delta.tool_calls.into_iter().flatten() {
                             let (name_fragment, args_fragment) = match tc.function {
                                 Some(f) => (f.name, f.arguments),
@@ -104,8 +107,11 @@ impl ChatStream {
                                 args_fragment,
                             });
                         }
-                        // Yield buffered tool-call fragments before reading
-                        // more wire data; empty when this choice had none.
+                        if let Some(content) = choice.delta.content.filter(|c| !c.is_empty()) {
+                            self.pending.push_back(ChatEvent::Delta(content));
+                        }
+                        // Yield one buffered event before reading more
+                        // wire data; empty when this choice had none.
                         if let Some(event) = self.pending.pop_front() {
                             return Ok(Some(event));
                         }

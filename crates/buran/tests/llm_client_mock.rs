@@ -121,3 +121,48 @@ async fn tool_call_deltas_stream_verbatim() {
         ]
     );
 }
+
+/// A provider may coalesce deltas: one ChatChunk carrying BOTH text content
+/// and tool-call fragments. The text must not starve the tool fragments
+/// (and vice versa) — the plan's Task 6 notes this exact wire shape.
+#[tokio::test]
+async fn mixed_content_and_tool_calls_in_one_chunk_survive() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response_frames(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(vec![
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"fs__read\",\"arguments\":\"{\\\"pa\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ])
+            .unwrap(),
+    );
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = s.next().await.unwrap() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, ChatEvent::Delta(t) if t == "Let me check.")),
+        "text content must be delivered: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev, ChatEvent::ToolCallDelta { .. }))
+            .count(),
+        1,
+        "the chunk's tool-call fragment must not be dropped: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&ChatEvent::Done(Some(
+            buran::llm::types::FinishReason::ToolCalls
+        )))
+    );
+}
