@@ -684,3 +684,195 @@ fn serve_child_stdout_purity() {
             .unwrap_or_else(|e| panic!("stdout line not JSON: {line:?} ({e})"));
     }
 }
+
+/// Concurrent prompts on one session: the second `prompt` while the first
+/// turn is still running must be rejected with an error, not silently fork
+/// the conversation (`mem::take` of the session history would hand an empty
+/// history to the second turn). The first turn is held open by a permission
+/// question the test client never answers; the second prompt must come back
+/// as `Err`; then the client answers (deny path) and the first turn
+/// completes cleanly.
+#[tokio::test(flavor = "current_thread")]
+async fn second_concurrent_prompt_is_rejected() {
+    use agent_client_protocol::on_receive_request;
+    use agent_client_protocol::v1::schema::{
+        PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, SelectedPermissionOutcome,
+    };
+
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(tool_call_body().into_boxed_str())]));
+    // Turn 1 continues after the deny; never reached if the guard fails,
+    // but queued so the held turn can complete when we release it.
+    let turn2 = format!("data: {}\n\n{}", text_chunk("denied done"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    // The client parks on the permission request (turn 1 in flight) until
+    // the test signals; answering keeps handlers-on-dispatch-loop semantics.
+    // A flag records that the permission request ARRIVED: that is the
+    // observable "turn 1 mid-flight" signal (permission requests surface
+    // through the handler, not as SessionUpdate variants).
+    let release = tokio::sync::oneshot::channel::<()>();
+    let mut release_tx = Some(release.0);
+    let release_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release.1)));
+    let release_rx2 = release_rx.clone();
+    let got_permission = std::sync::Arc::new(tokio::sync::Notify::new());
+    let got_permission2 = got_permission.clone();
+    let client = Client
+        .v1()
+        .on_receive_request(
+            async move |_request: RequestPermissionRequest, responder, _cx| {
+                got_permission2.notify_one();
+                // Wait for the test's signal (the second prompt was already
+                // rejected), then answer with a deny so turn 1 completes.
+                if let Some(rx) = release_rx2.lock().await.take() {
+                    let _ = rx.await;
+                }
+                let reject = _request
+                    .options
+                    .iter()
+                    .find(|o| o.kind == PermissionOptionKind::RejectOnce)
+                    .map(|o| o.option_id.clone());
+                if let Some(id) = reject {
+                    let _ = responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+                    ));
+                }
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+            on_receive_request!(),
+        )
+        .connect_with(agent, async |cx| {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } =
+                cx.build_session_cwd()?.block_task().start_session().await?;
+            session.send_prompt("first")?;
+
+            // Wait until turn 1 is genuinely mid-flight: its permission
+            // request arrived at the client handler above.
+            tokio::time::timeout(TIMEOUT, got_permission.notified())
+                .await
+                .expect("permission request must arrive while turn 1 runs");
+
+            // Second prompt on the SAME session while turn 1 runs: the
+            // send itself is fire-and-forget (Ok means the request left);
+            // the agent's rejection arrives as a PromptResponse(Err(..))
+            // on the update stream, ordered before turn 1's completion.
+            session.send_prompt("second")?;
+            // Release turn 1 immediately: its handler answers the deny and
+            // the turn completes. The rejection (fast, no LLM round) is
+            // ordered on the stream before turn 1's completion (needs the
+            // remaining LLM round).
+            release_tx.take().unwrap().send(()).unwrap();
+            let mut second_rejected = false;
+            loop {
+                match session.read_update().await? {
+                    SessionMessage::PromptResponse(Err(error)) => {
+                        second_rejected = true;
+                        assert!(
+                            error.to_string().contains("in flight"),
+                            "rejection must name the concurrent turn: {error}"
+                        );
+                    }
+                    SessionMessage::PromptResponse(Ok(resp)) => {
+                        // Turn 1's completion must come AFTER the rejection:
+                        // if the guard never fired, turn 1's PromptResponse
+                        // would arrive alone with no prior Err.
+                        assert!(
+                            second_rejected,
+                            "no rejection seen before turn 1 completed: guard did not fire"
+                        );
+                        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
+/// Mid-turn LLM failure: the turn has already streamed deltas, so the
+/// protocol has no error completion — the failure must surface as an
+/// `[error: ...]` message chunk the user reads, followed by EndTurn. A bare
+/// EndTurn (the pre-review behavior) looks like a clean stop and loses the
+/// failure.
+#[tokio::test(flavor = "current_thread")]
+async fn mid_turn_llm_error_surfaces_as_chunk_before_end_turn() {
+    use agent_client_protocol::v1::schema::ContentBlock;
+    use hclient::{Error as HclientError, ErrorKind};
+
+    let m = MockTransport::new();
+    // One text delta delivered, then the SSE body errors mid-stream
+    // (a gateway dropping the connection): the loop's stream_round
+    // returns Err AFTER content reached the client.
+    let partial = format!("data: {}\n\n", text_chunk("partial answer"));
+    m.push_response_frames_then_error(
+        sse(vec![Box::leak(partial.into_boxed_str())]),
+        HclientError::new(ErrorKind::Other, std::io::Error::other("connection reset")),
+    );
+    let m2 = m.clone();
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        let mut saw_error_chunk = false;
+        loop {
+            match session.read_update().await? {
+                SessionMessage::Message(dispatch) => {
+                    let untyped = dispatch.to_untyped_message()?;
+                    if let Ok(notification) =
+                        SessionNotification::parse_message(untyped.method(), untyped.params())
+                        && let SessionUpdate::AgentMessageChunk(chunk) = notification.update
+                        && let ContentBlock::Text(text) = chunk.content
+                        && text.text.contains("[error:")
+                    {
+                        saw_error_chunk = true;
+                    }
+                }
+                SessionMessage::PromptResponse(resp) => {
+                    let resp = resp.expect("turn completes");
+                    assert_eq!(resp.stop_reason, StopReason::EndTurn);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_error_chunk,
+            "an [error: ...] chunk must precede EndTurn on a mid-turn LLM failure"
+        );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}

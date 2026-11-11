@@ -160,6 +160,10 @@ pub enum FinishReason {
     Length,
     #[serde(rename = "content_filter")]
     ContentFilter,
+    /// Loop-internal: max_turns exhausted without a natural stop. Never
+    /// parsed from the wire — an API never sends this name; run_turn
+    /// synthesizes it so callers see a cut loop, not a clean end.
+    MaxTurnRequests,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

@@ -192,7 +192,6 @@ impl AgentLoop {
         session.history.push(ChatMessage::user(user_text));
 
         let mut tool_calls_made: u32 = 0;
-        let mut finish = FinishReason::Stop;
         // `<skill>` detection applies to the turn's first assistant
         // message only (ADR 0004).
         let mut first_assistant_message = true;
@@ -244,7 +243,7 @@ impl AgentLoop {
                     }
                 }
                 session.history.push(ChatMessage::assistant(assistant_text));
-                finish = round_finish.unwrap_or(FinishReason::Stop);
+                let finish = round_finish.unwrap_or(FinishReason::Stop);
                 let _ = events.send(TurnEvent::TurnDone(finish)).await;
                 return Ok(TurnSummary {
                     finish,
@@ -256,7 +255,6 @@ impl AgentLoop {
             session
                 .history
                 .push(ChatMessage::assistant_with_tool_calls(requested.clone()));
-            finish = round_finish.unwrap_or(FinishReason::ToolCalls);
 
             for call in &requested {
                 let _ = events
@@ -311,11 +309,14 @@ impl AgentLoop {
             // Next round: the model sees the tool results.
         }
 
-        // max_turns exhausted without a natural stop: report the last finish
-        // reason so callers see the loop was cut, not a clean end.
-        let _ = events.send(TurnEvent::TurnDone(finish)).await;
+        // max_turns exhausted without a natural stop: signal MaxTurnRequests
+        // so the client sees the loop was cut, not a clean end (the ACP
+        // StopReason has an exact variant for this).
+        let _ = events
+            .send(TurnEvent::TurnDone(FinishReason::MaxTurnRequests))
+            .await;
         Ok(TurnSummary {
-            finish,
+            finish: FinishReason::MaxTurnRequests,
             tool_calls_made,
         })
     }

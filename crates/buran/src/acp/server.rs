@@ -36,6 +36,19 @@ struct SessionHandle {
     skills: Vec<crate::skills::SkillDescription>,
     session: SessionState,
     cancel_tx: watch::Sender<bool>,
+    /// In-flight prompt guard: `mem::take(&mut handle.session)` hands the
+    /// history to a running turn; a second concurrent prompt would find it
+    /// empty and fork the conversation. MVP is one turn per session — the
+    /// second prompt is rejected until the first resolves.
+    turn_in_flight: bool,
+}
+
+/// Why a prompt turn failed: before it started (a request-level rejection
+/// the client sees as an error response) or mid-turn (after deltas may have
+/// streamed — the failure surfaces as a message chunk, then EndTurn).
+enum PromptError {
+    Rejected(anyhow::Error),
+    MidTurn(anyhow::Error),
 }
 
 /// Shared server state: one MCP manager per process, sessions per client.
@@ -166,6 +179,7 @@ fn build_agent(
                             skills,
                             session: SessionState::default(),
                             cancel_tx,
+                            turn_in_flight: false,
                         },
                     );
                 responder.respond(NewSessionResponse::new(session_id))
@@ -181,12 +195,40 @@ fn build_agent(
                 let provider = provider_prompt.clone();
                 let conn = cx.clone();
                 cx.spawn(async move {
-                    let stop = run_prompt_turn(&state, &provider, &req, &conn).await;
-                    let stop = stop.unwrap_or_else(|error| {
-                        tracing::error!(%error, "prompt turn failed");
-                        StopReason::EndTurn
-                    });
-                    responder.respond(PromptResponse::new(stop))
+                    match run_prompt_turn(&state, &provider, &req, &conn).await {
+                        Ok(stop) => {
+                            let _ = responder.respond(PromptResponse::new(stop));
+                        }
+                        // A turn that failed before producing anything
+                        // (unknown session, concurrent prompt) is a request
+                        // error: the client sees it, not a fake EndTurn.
+                        Err(PromptError::Rejected(error)) => {
+                            tracing::error!(%error, "prompt rejected");
+                            let _ =
+                                responder.respond_with_error(agent_client_protocol::Error::new(
+                                    agent_client_protocol::ErrorCode::INTERNAL_ERROR,
+                                    error.to_string(),
+                                ));
+                        }
+                        // A turn that failed mid-flight (LLM error after
+                        // deltas may have flown): the protocol has no error
+                        // completion for a started turn — surface the
+                        // failure as a message chunk the user reads, then
+                        // end. A bare EndTurn would look like a clean stop.
+                        Err(PromptError::MidTurn(error)) => {
+                            tracing::error!(%error, "prompt turn failed mid-flight");
+                            let _ = conn.send_notification(SessionNotification::new(
+                                req.session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!(
+                                        "\n[error: {error}]"
+                                    ))),
+                                )),
+                            ));
+                            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                    }
+                    Ok::<(), agent_client_protocol::Error>(())
                 })
             },
             on_receive_request!(),
@@ -216,7 +258,7 @@ async fn run_prompt_turn(
     provider: &ProviderConfig,
     req: &PromptRequest,
     conn: &ConnectionTo<AcpClient>,
-) -> anyhow::Result<StopReason> {
+) -> Result<StopReason, PromptError> {
     // Flatten the prompt blocks into one user text (text blocks only for
     // MVP; resource blocks arrive in v1.5 with context attachments).
     let mut text = String::new();
@@ -229,11 +271,21 @@ async fn run_prompt_turn(
         }
     }
 
-    let (mut session, system_prompt, skills, mut cancel_rx) = {
+    let (session, system_prompt, skills, cancel_rx) = {
         let mut sessions = state.sessions.lock().expect("sessions lock");
-        let handle = sessions
-            .get_mut(&req.session_id)
-            .ok_or_else(|| anyhow::anyhow!("prompt for unknown session {}", req.session_id.0))?;
+        let handle = sessions.get_mut(&req.session_id).ok_or_else(|| {
+            PromptError::Rejected(anyhow::anyhow!(
+                "prompt for unknown session {}",
+                req.session_id.0
+            ))
+        })?;
+        if handle.turn_in_flight {
+            return Err(PromptError::Rejected(anyhow::anyhow!(
+                "session {} already has a prompt in flight",
+                req.session_id.0
+            )));
+        }
+        handle.turn_in_flight = true;
         let cancel_rx = handle.cancel_tx.subscribe();
         (
             std::mem::take(&mut handle.session),
@@ -242,7 +294,53 @@ async fn run_prompt_turn(
             cancel_rx,
         )
     };
+    // All exits below must hand the session state back and clear the guard;
+    // the closure form keeps the unlock and the store on one path.
+    let turn = TurnContext {
+        text,
+        session,
+        system_prompt,
+        skills,
+        cancel_rx,
+    };
+    let result = run_prompt_turn_inner(state, provider, req, conn, turn).await;
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        if let Some(handle) = sessions.get_mut(&req.session_id) {
+            handle.turn_in_flight = false;
+            // The turn may have exited early (LLM error): keep whatever
+            // history the turn recorded instead of dropping it.
+        }
+    }
+    result.map_err(PromptError::MidTurn)
+}
 
+/// Everything a turn body needs from its session, taken under the sessions
+/// lock and handed back after the turn resolves.
+struct TurnContext {
+    text: String,
+    session: SessionState,
+    system_prompt: String,
+    skills: Vec<crate::skills::SkillDescription>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+/// The turn body, split out so `run_prompt_turn` can own the guard's
+/// set/clear around it.
+async fn run_prompt_turn_inner(
+    state: &ServerState,
+    provider: &ProviderConfig,
+    req: &PromptRequest,
+    conn: &ConnectionTo<AcpClient>,
+    turn: TurnContext,
+) -> anyhow::Result<StopReason> {
+    let TurnContext {
+        text,
+        mut session,
+        system_prompt,
+        skills,
+        mut cancel_rx,
+    } = turn;
     let llm = (state.llm_factory)(provider)?;
     let catalog = state.mcp.catalog().await;
     let tools: Arc<McpManager> = state.mcp.clone();
@@ -363,6 +461,7 @@ async fn run_prompt_turn(
                 StopReason::EndTurn
             }
             FinishReason::Length => StopReason::MaxTokens,
+            FinishReason::MaxTurnRequests => StopReason::MaxTurnRequests,
         }
     })
 }
@@ -427,8 +526,14 @@ fn new_session_id() -> String {
     format!("buran-session-{nanos}")
 }
 
-/// Production entry: real serve on stdio. Logs never touch stdout.
+/// Production entry: real serve on stdio. Logs go to stderr only — stdout
+/// is the ACP JSON-RPC channel and must stay clean.
 pub fn serve() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
