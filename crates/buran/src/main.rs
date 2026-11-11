@@ -34,7 +34,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => buran::run::serve(),
-        Command::Doctor => buran::run::doctor(),
+        Command::Doctor => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(buran::run::doctor())
+        }
         Command::Mcp { cmd } => match cmd {
             McpCommand::List => buran::run::mcp_list(),
         },

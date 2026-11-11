@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod agentsmd;
 pub mod config;
+pub mod doctor;
 pub mod llm;
 pub mod mcp;
 pub mod run;
