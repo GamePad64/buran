@@ -118,3 +118,82 @@ fn unknown_record_types_are_skipped_on_replay() {
         matches!(&records[1], TranscriptRecord::Message(m) if m.content.as_deref() == Some("after"))
     );
 }
+
+#[test]
+fn fork_never_touches_the_original_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let mut f = store.create(meta()).unwrap();
+    f.append(&TranscriptRecord::Message(ChatMessage::user("one")))
+        .unwrap();
+
+    // A torn tail on the source must not be "repaired" by a fork —
+    // the original file is never opened for writing (brief contract),
+    // so its bytes survive byte-for-byte even though `open` would
+    // truncate the same tail.
+    let path = dir.path().join(format!("{}.jsonl", f.id()));
+    std::fs::write(&path, {
+        let mut b = std::fs::read(&path).unwrap();
+        b.extend_from_slice(b"{\"type\":\"msg"); // torn tail, no newline
+        b
+    })
+    .unwrap();
+    let original = std::fs::read(&path).unwrap();
+
+    let forked = store.fork(f.id(), meta()).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "fork must leave the source file byte-for-byte identical"
+    );
+    // The fork itself got the surviving records (head + "one").
+    let (_, records) = store.open(forked.id()).unwrap();
+    assert_eq!(
+        records.len(),
+        2,
+        "fork carries head + surviving body records"
+    );
+    assert!(matches!(
+        &records[1],
+        TranscriptRecord::Message(m) if m.content.as_deref() == Some("one")
+    ));
+}
+
+#[test]
+fn list_survives_a_corrupt_body_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let mut f = store.create(meta()).unwrap();
+    f.append(&TranscriptRecord::Message(ChatMessage::user("keep")))
+        .unwrap();
+    // Hand-write a corrupt line into the BODY (parseable as nothing,
+    // has no `type` key, not last — a hard Corrupt for `open`).
+    use std::io::Write;
+    let path = dir.path().join(format!("{}.jsonl", f.id()));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, r#"{{"nonsense":true}}"#).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"message","role":"user","content":"after"}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    // open() correctly refuses the file…
+    assert!(
+        store.open(f.id()).is_err(),
+        "corrupt mid-file line is fatal for replay"
+    );
+    // …but the catalog still lists the session from its head line.
+    let sessions = store.list().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "corrupt body must not drop the session from list()"
+    );
+    assert_eq!(sessions[0].id, f.id());
+    assert_eq!(sessions[0].meta.model, "test-model");
+}

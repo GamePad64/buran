@@ -19,17 +19,42 @@ pub(super) fn good_prefix_len(path: &Path) -> Result<u64, StoreError> {
     replay_inner(path).map(|(_, len)| len)
 }
 
-/// Extract just the head metadata record (for `Store::list` — no body read).
+/// Extract the head metadata by reading exactly ONE line (for `Store::list`).
+/// The catalog must not fail a whole session because of a corrupt line in
+/// its body — only the head line is inspected here, so body damage stays
+/// invisible to `list` (full validation remains `open`'s job).
+///
+/// A torn FIRST line (a crash before the head was fully written) cannot
+/// yield metadata, so the session has no identity: reported as `Corrupt`,
+/// which `list` propagates. That file is damage from a failed `create`
+/// rather than a listable session; dropping it with a loud error beats
+/// silently listing a session that cannot later be `open`ed.
 pub(super) fn head_meta(path: &Path) -> Result<TranscriptMeta, StoreError> {
-    for record in replay(path)? {
-        if let TranscriptRecord::Metadata(meta) = record {
-            return Ok(meta);
-        }
+    let file = File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => StoreError::NotFound(
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        _ => e.into(),
+    })?;
+    let mut line = String::new();
+    BufReader::new(file)
+        .read_line(&mut line)
+        .map_err(StoreError::Io)?;
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    match serde_json::from_str::<TranscriptRecord>(trimmed) {
+        Ok(TranscriptRecord::Metadata(meta)) => Ok(meta),
+        Ok(_) => Err(StoreError::Corrupt {
+            path: path.to_path_buf(),
+            reason: "first line is not a metadata head".into(),
+        }),
+        Err(e) => Err(StoreError::Corrupt {
+            path: path.to_path_buf(),
+            reason: format!("head line: {e}"),
+        }),
     }
-    Err(StoreError::Corrupt {
-        path: path.to_path_buf(),
-        reason: "no metadata head record".into(),
-    })
 }
 
 /// Single pass: each line is judged as it is read, and a parse failure is

@@ -58,7 +58,7 @@ impl Store {
             .expect("TranscriptRecord serialization cannot fail: no maps/floats");
         file.write_all(head.as_bytes())?;
         file.write_all(b"\n")?;
-        Ok(SessionFile { id, file })
+        Ok(SessionFile { id, path, file })
     }
 
     /// Replays the transcript and returns an append handle positioned
@@ -83,6 +83,7 @@ impl Store {
         Ok((
             SessionFile {
                 id: id.to_string(),
+                path: path.clone(),
                 file,
             },
             records,
@@ -112,14 +113,18 @@ impl Store {
     }
 
     /// Copies all records except the head; writes a fresh head carrying
-    /// `forked_from`. The original file is never opened for writing.
+    /// `forked_from`. The original file is never opened for writing —
+    /// existence is checked on the path and replay runs on a read-only
+    /// handle, so a torn tail on the source is NOT truncated as a side
+    /// effect (a fork repairs nothing in the transcript it forks from).
     pub fn fork(&self, id: &str, mut fork_meta: TranscriptMeta) -> Result<SessionFile, StoreError> {
-        // Validates existence and replays the source; the append handle
-        // below is dropped unused — `fork` never writes to the original.
-        let _ = self.open(id)?;
+        let path = self.path_for(id);
+        if !path.exists() {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
         fork_meta.forked_from = Some(id.to_string());
         let mut new_file = self.create(fork_meta)?;
-        for record in replay::replay(&self.path_for(id))? {
+        for record in replay::replay(&path)? {
             if matches!(record, TranscriptRecord::Metadata(_)) {
                 continue; // original head replaced by the fresh one
             }
@@ -145,6 +150,7 @@ impl Store {
 
 pub struct SessionFile {
     id: String,
+    path: PathBuf,
     file: File,
 }
 
@@ -160,7 +166,7 @@ impl SessionFile {
     /// strictly sequential.
     pub fn append(&mut self, record: &TranscriptRecord) -> Result<(), StoreError> {
         let line = serde_json::to_string(record).map_err(|e| StoreError::Corrupt {
-            path: self.id.clone().into(),
+            path: self.path.clone(),
             reason: format!("serialize: {e}"),
         })?;
         self.file.write_all(line.as_bytes())?;
