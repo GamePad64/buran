@@ -123,8 +123,12 @@ impl Store {
             return Err(StoreError::NotFound(id.to_string()));
         }
         fork_meta.forked_from = Some(id.to_string());
+        // Replay BEFORE create: a corrupt mid-file source must fail the
+        // fork without leaving an orphan fork file behind (a fresh head
+        // alone in the catalog).
+        let records = replay::replay(&path)?;
         let mut new_file = self.create(fork_meta)?;
-        for record in replay::replay(&path)? {
+        for record in records {
             if matches!(record, TranscriptRecord::Metadata(_)) {
                 continue; // original head replaced by the fresh one
             }

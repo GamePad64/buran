@@ -96,7 +96,7 @@ fn append_after_torn_tail_produces_a_valid_file() {
 fn unknown_record_types_are_skipped_on_replay() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(dir.path());
-    let mut f = store.create(meta()).unwrap();
+    let f = store.create(meta()).unwrap();
     // Hand-write a line with an unknown `type` (forward compat, ADR 0007).
     use std::io::Write;
     let path = dir.path().join(format!("{}.jsonl", f.id()));
