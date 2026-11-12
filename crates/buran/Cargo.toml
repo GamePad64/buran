@@ -19,9 +19,11 @@ tracing-subscriber.workspace = true
 hclient = { version = "0.1.0-alpha.20", features = ["default-transport", "json"] }
 agent-client-protocol = { version = "5", features = ["stdio"] }
 rmcp = { version = "3.9.0", default-features = false, features = ["client", "macros", "transport-child-process"] }
+uuid.workspace = true
 
 [dev-dependencies]
 hclient = { version = "0.1.0-alpha.20", features = ["test-util", "json"] }
 futures = "0.3"
 http = "1"
 tempfile = "3"
+uuid.workspace = true

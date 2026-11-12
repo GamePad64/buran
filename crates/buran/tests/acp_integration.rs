@@ -24,6 +24,30 @@ use hclient::mock::MockTransport;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Session IDs are UUIDv7: lexicographic order equals creation order, so
+/// `--resume latest` later picks the max filename without reading file
+/// contents (sessions store spec).
+#[test]
+fn new_session_ids_are_uuidv7_and_chronologically_ordered() {
+    let a = buran::acp::new_session_id_for_test();
+    let b = buran::acp::new_session_id_for_test();
+    let ua = uuid::Uuid::parse_str(&a).expect("valid uuid");
+    let ub = uuid::Uuid::parse_str(&b).expect("valid uuid");
+    assert_eq!(
+        ua.get_version(),
+        Some(uuid::Version::SortRand),
+        "must be v7"
+    );
+    assert_eq!(
+        ub.get_version(),
+        Some(uuid::Version::SortRand),
+        "must be v7"
+    );
+    // Two calls may land in the same millisecond; the counter inside v7
+    // keeps them distinct, so ids are monotonic (equal never in practice).
+    assert!(a <= b, "v7 ids must be chronologically monotonic");
+}
+
 fn provider() -> ProviderConfig {
     ProviderConfig {
         name: "test-provider".into(),

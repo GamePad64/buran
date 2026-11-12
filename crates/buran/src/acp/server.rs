@@ -518,12 +518,16 @@ fn build_system_prompt(
 }
 
 fn new_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("buran-session-{nanos}")
+    // UUIDv7: time-ordered, so lexicographic filename order equals
+    // chronological order — `--resume latest` resolves by filename
+    // without file contents (sessions store spec).
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// Test seam: integration suite asserts the ID format contract.
+#[doc(hidden)]
+pub fn new_session_id_for_test() -> String {
+    new_session_id()
 }
 
 /// Production entry: real serve on stdio. Logs go to stderr only — stdout
