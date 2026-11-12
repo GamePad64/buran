@@ -33,12 +33,7 @@ fn compaction_point_record_round_trips() {
 
 #[test]
 fn metadata_record_round_trips() {
-    let record = TranscriptRecord::Metadata(TranscriptMeta {
-        model: "test-model".into(),
-        provider: "test-provider".into(),
-        started_at: "2026-11-11T00:00:00Z".into(),
-        ended_at: None,
-    });
+    let record = TranscriptRecord::Metadata(record_meta());
     let json = serde_json::to_string(&record).unwrap();
     let back: TranscriptRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(back, record);
@@ -58,5 +53,7 @@ fn record_meta() -> TranscriptMeta {
         provider: "test-provider".into(),
         started_at: "2026-11-11T00:00:00Z".into(),
         ended_at: None,
+        cwd: std::path::PathBuf::from("/tmp/proj"),
+        forked_from: None,
     }
 }

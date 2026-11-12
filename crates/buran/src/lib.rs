@@ -7,3 +7,4 @@ pub mod mcp;
 pub mod run;
 pub mod session;
 pub mod skills;
+pub mod store;

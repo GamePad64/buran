@@ -31,6 +31,13 @@ pub struct TranscriptMeta {
     pub provider: String,
     /// RFC 3339 timestamp of session start.
     pub started_at: String,
-    /// RFC 3339 timestamp of session end, set on graceful shutdown.
+    /// RFC 3339 timestamp of session end. Never written in v1.5 (would
+    /// rewrite the append-only head); kept for wire compatibility.
     pub ended_at: Option<String>,
+    /// Working directory the session was created in. `session/loadSession`
+    /// requires the request cwd to match (sessions store spec).
+    pub cwd: std::path::PathBuf,
+    /// Session this one forked from, when `--fork` created it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
