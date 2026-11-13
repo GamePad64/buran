@@ -160,3 +160,36 @@ async fn client_loads_session_and_surfaces_replayed_user_text() {
 
     client.shutdown();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn resume_latest_with_empty_store_fails_loudly() {
+    // Empty HOME store: "latest" cannot resolve. The TUI must fail the
+    // spawn with the loud error, not silently start a fresh session. The
+    // resolution runs inside the parked main_fn task, so the error travels
+    // through the ready slot; the process-wide HOME override points it at
+    // the empty tempdir store. Safety: set_var is process-global, but no
+    // other test in this binary reads HOME — the rest spawn non-interactive
+    // `bash -c` agents (no rc files, no tilde expansion), so the window is
+    // benign even under the parallel harness.
+    let home = tempfile::tempdir().unwrap();
+    // SAFETY: see the comment above — single brief window, no concurrent
+    // HOME readers in this test binary.
+    unsafe { std::env::set_var("HOME", home.path()) };
+    let result = AcpClient::spawn(
+        &format!("bash -c {}", shell_quote(&fake_agent_script())),
+        Some("latest".into()),
+        None,
+    )
+    .await;
+    unsafe { std::env::remove_var("HOME") };
+    match result {
+        Err(error) => assert!(
+            error.to_string().contains("no stored sessions to resume"),
+            "the resolution error must surface: {error}"
+        ),
+        Ok(client) => {
+            client.shutdown();
+            panic!("empty-store resume must not succeed");
+        }
+    }
+}
