@@ -36,6 +36,10 @@ struct SessionHandle {
     skills: Vec<crate::skills::SkillDescription>,
     session: SessionState,
     cancel_tx: watch::Sender<bool>,
+    /// Append handle for this session's transcript; `None` when the store
+    /// refused the file at `newSession` time (persistence degrades, the
+    /// session still runs fully in memory — sessions store spec).
+    store_file: Option<crate::store::SessionFile>,
     /// In-flight prompt guard: `mem::take(&mut handle.session)` hands the
     /// history to a running turn; a second concurrent prompt would find it
     /// empty and fork the conversation. MVP is one turn per session — the
@@ -51,9 +55,11 @@ enum PromptError {
     MidTurn(anyhow::Error),
 }
 
-/// Shared server state: one MCP manager per process, sessions per client.
+/// Shared server state: one MCP manager per process, sessions per client,
+/// one sessions store per process.
 struct ServerState {
     config: Config,
+    store: crate::store::Store,
     mcp: Arc<McpManager>,
     llm_factory: LlmFactory,
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
@@ -117,8 +123,16 @@ pub async fn agent_builder_with_config(
 
     let mcp = McpManager::start(&config.mcp_servers, std::time::Duration::from_secs(10)).await?;
 
+    let store = crate::store::Store::new(
+        config
+            .sessions_dir
+            .clone()
+            .unwrap_or_else(crate::store::Store::default_root),
+    );
+
     let state = Arc::new(ServerState {
         config,
+        store,
         mcp: Arc::new(mcp),
         llm_factory: Arc::new(llm_factory),
         sessions: Mutex::new(HashMap::new()),
@@ -142,6 +156,7 @@ fn build_agent(
     let state_new_session = state.clone();
     let state_prompt = state.clone();
     let state_cancel = state.clone();
+    let provider_new_session = provider.clone();
     let provider_prompt = provider.clone();
 
     Agent
@@ -163,11 +178,43 @@ fn build_agent(
                     // (honest rejection, recorded in ADR 0003).
                     tracing::warn!("client-supplied MCP servers not supported yet");
                 }
-                let session_id = SessionId::new(new_session_id());
                 let system_prompt =
                     build_system_prompt(&req.cwd, &state_new_session.config.skills_dirs);
                 let skills = crate::skills::scan(&state_new_session.config.skills_dirs);
                 let (cancel_tx, _) = watch::channel(false);
+                // Transcript head: model/provider/cwd pin the session's
+                // identity for `loadSession` later (sessions store spec).
+                // Persistence degrades to pre-v1.5 behavior on failure: the
+                // session runs in memory, the failure is logged (Review
+                // Focus #1) — never fatal for the session itself.
+                let store_file =
+                    match state_new_session
+                        .store
+                        .create(crate::session::TranscriptMeta {
+                            model: provider_new_session.model.clone(),
+                            provider: provider_new_session.name.clone(),
+                            started_at: crate::store::rfc3339_now(),
+                            ended_at: None,
+                            cwd: req.cwd.clone(),
+                            forked_from: None,
+                        }) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            tracing::error!(
+                                %e,
+                                "cannot create session transcript — continuing without persistence"
+                            );
+                            None
+                        }
+                    };
+                // The ACP session id IS the transcript filename stem (the
+                // store's uuidv7), so `loadSession` finds the transcript
+                // under the id the client already knows. Degraded sessions
+                // (no transcript) get a bare uuidv7.
+                let session_id = match &store_file {
+                    Some(f) => SessionId::new(f.id().to_string()),
+                    None => SessionId::new(new_session_id()),
+                };
                 state_new_session
                     .sessions
                     .lock()
@@ -179,6 +226,7 @@ fn build_agent(
                             skills,
                             session: SessionState::default(),
                             cancel_tx,
+                            store_file,
                             turn_in_flight: false,
                         },
                     );
@@ -271,7 +319,10 @@ async fn run_prompt_turn(
         }
     }
 
-    let (session, system_prompt, skills, cancel_rx) = {
+    // History length BEFORE `mem::take`, under the same lock: everything
+    // the turn appends past this mark belongs to this turn's transcript
+    // slice (persisted in the guard block below).
+    let (starting_history_len, session, system_prompt, skills, cancel_rx) = {
         let mut sessions = state.sessions.lock().expect("sessions lock");
         let handle = sessions.get_mut(&req.session_id).ok_or_else(|| {
             PromptError::Rejected(anyhow::anyhow!(
@@ -286,8 +337,10 @@ async fn run_prompt_turn(
             )));
         }
         handle.turn_in_flight = true;
+        let starting_history_len = handle.session.history.len();
         let cancel_rx = handle.cancel_tx.subscribe();
         (
+            starting_history_len,
             std::mem::take(&mut handle.session),
             handle.system_prompt.clone(),
             handle.skills.clone(),
@@ -308,8 +361,27 @@ async fn run_prompt_turn(
         let mut sessions = state.sessions.lock().expect("sessions lock");
         if let Some(handle) = sessions.get_mut(&req.session_id) {
             handle.turn_in_flight = false;
-            // The turn may have exited early (LLM error): keep whatever
-            // history the turn recorded instead of dropping it.
+            // Persist everything this turn added to history, in order. The
+            // loop stays I/O-free (ADR 0001); the server layer owns the
+            // store. The user prompt is included: the loop pushes it at
+            // loop_.rs:192 like every other message. An append failure
+            // degrades (Review Focus #1): the conversation continues in
+            // memory, later appends still try — do not `?` out, the turn
+            // result must not change. The turn may have exited early (LLM
+            // error): keep whatever history the turn recorded instead of
+            // dropping it.
+            if let Some(file) = handle.store_file.as_mut() {
+                for msg in handle.session.history[starting_history_len..].iter() {
+                    if let Err(e) =
+                        file.append(&crate::session::TranscriptRecord::Message(msg.clone()))
+                    {
+                        tracing::error!(
+                            %e,
+                            "transcript append failed — continuing without persistence"
+                        );
+                    }
+                }
+            }
         }
     }
     result.map_err(PromptError::MidTurn)

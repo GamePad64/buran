@@ -20,6 +20,7 @@ use agent_client_protocol::{
 };
 use buran::config::{ApiKey, ProviderConfig};
 use buran::llm::LlmClient;
+use buran::session::TranscriptRecord;
 use hclient::mock::MockTransport;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,6 +101,7 @@ fn test_config(skills_dirs: Vec<std::path::PathBuf>) -> buran::config::Config {
         skills_dirs,
         permission: buran::config::PermissionPolicy::Ask,
         permission_timeout: Duration::from_secs(2),
+        sessions_dir: None,
     }
 }
 
@@ -831,6 +833,71 @@ async fn second_concurrent_prompt_is_rejected() {
         .expect("ACP connection failed");
 }
 
+/// The whole turn persists to the transcript in history order: head
+/// metadata (model + cwd), then the user message, then the assistant
+/// reply. The ACP session id must equal the transcript filename stem, so
+/// `loadSession` can find it later (sessions store spec).
+#[tokio::test(flavor = "current_thread")]
+async fn a_turns_messages_are_persisted_in_history_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(hello_body().into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup {
+            mut session,
+            response,
+            ..
+        } = cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        let text = session.read_to_string().await?;
+        assert_eq!(text, "Hello from buran");
+        // The ACP session id must equal the transcript filename stem.
+        let id = response.session_id.0.to_string();
+        let (_, records) = buran::store::Store::new(dir.path())
+            .open(&id)
+            .expect("transcript exists under the ACP session id");
+        assert!(
+            matches!(&records[0], TranscriptRecord::Metadata(meta)
+                if meta.model == "test-model"
+                    && meta.cwd == std::env::current_dir().unwrap()),
+            "head metadata recorded (model + cwd)"
+        );
+        assert!(
+            matches!(&records[1], TranscriptRecord::Message(msg)
+                if msg.role == buran::llm::types::Role::User
+                    && msg.content.as_deref() == Some("hi")),
+            "user message first"
+        );
+        assert!(
+            matches!(&records[2], TranscriptRecord::Message(msg)
+                if msg.role == buran::llm::types::Role::Assistant
+                    && msg.content.as_deref() == Some("Hello from buran")),
+            "assistant message second"
+        );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
 /// Mid-turn LLM failure: the turn has already streamed deltas, so the
 /// protocol has no error completion — the failure must surface as an
 /// `[error: ...]` message chunk the user reads, followed by EndTurn. A bare
@@ -892,6 +959,45 @@ async fn mid_turn_llm_error_surfaces_as_chunk_before_end_turn() {
             saw_error_chunk,
             "an [error: ...] chunk must precede EndTurn on a mid-turn LLM failure"
         );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
+/// `store.create` failure at `newSession` time degrades to in-memory: the
+/// session must still work fully (Review Focus #1). The sessions root is
+/// pointed under `/proc`, which is unwritable everywhere on Linux, so the
+/// create fails deterministically.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_create_failure_does_not_kill_the_session() {
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(hello_body().into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(std::path::PathBuf::from("/proc/nonexistent-buran-sessions"));
+
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        // The full turn completes despite the store being unusable.
+        let text = session.read_to_string().await?;
+        assert_eq!(text, "Hello from buran");
         Ok(())
     });
 

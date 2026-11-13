@@ -167,6 +167,10 @@ pub struct Config {
     /// How long `session/request_permission` waits for the client before
     /// denying (Ask policy). Not user-configurable in v1.
     pub permission_timeout: std::time::Duration,
+    /// Sessions-store root override; `None` uses `Store::default_root()`
+    /// (`~/.local/state/buran/sessions`). Not a config-file key (YAGNI,
+    /// sessions store spec): the field exists for tests and embedding.
+    pub sessions_dir: Option<PathBuf>,
 }
 
 /// Serialized `[provider]` / top-level shape of a config file.
@@ -285,6 +289,7 @@ impl Config {
             skills_dirs,
             permission,
             permission_timeout: std::time::Duration::from_secs(120),
+            sessions_dir: None,
         })
     }
 }
