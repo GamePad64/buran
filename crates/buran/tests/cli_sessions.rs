@@ -29,7 +29,7 @@ fn seed_session(home: &std::path::Path) -> &'static str {
         format!(
             "{}\n",
             serde_json::json!({
-                "type": "metadata", "model": "m", "provider": "p",
+                "type": "metadata", "model": "seed-model", "provider": "seed-provider",
                 "started_at": "2026-11-12T00:00:00Z", "ended_at": null,
                 "cwd": "/w"
             })
@@ -129,6 +129,23 @@ fn serve_fork_creates_the_branch_file_then_serves() {
     assert!(
         text.contains(id),
         "fork head must record forked_from={id}: {text}"
+    );
+
+    // A fork is "the same conversation, new branch": the fork head carries
+    // the SOURCE's model and provider (Finding 2, final review).
+    let head_line = text.lines().next().unwrap();
+    let head: serde_json::Value = serde_json::from_str(head_line).unwrap();
+    assert_eq!(
+        head["model"], "seed-model",
+        "fork head must copy source model: {head_line}"
+    );
+    assert_eq!(
+        head["provider"], "seed-provider",
+        "fork head must copy source provider: {head_line}"
+    );
+    assert_eq!(
+        head["cwd"], "/w",
+        "fork head must copy source cwd: {head_line}"
     );
 
     // Original untouched.

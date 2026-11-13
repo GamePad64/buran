@@ -138,6 +138,14 @@ impl Store {
         Ok(out)
     }
 
+    /// The session's head metadata, read without opening (no truncation,
+    /// no append handle): the pre-flight read for `--fork`, which must
+    /// copy the source's model/provider/cwd into the fork head without
+    /// mutating or repairing the source.
+    pub fn head(&self, id: &str) -> Result<TranscriptMeta, StoreError> {
+        replay::head_meta(&self.path_for(id))
+    }
+
     /// Copies all records except the head; writes a fresh head carrying
     /// `forked_from`. The original file is never opened for writing —
     /// existence is checked on the path and replay runs on a read-only

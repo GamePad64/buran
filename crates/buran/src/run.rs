@@ -10,16 +10,22 @@ use anyhow::Result;
 pub fn serve(resume: Option<String>, fork: Option<String>) -> Result<()> {
     let store = crate::store::Store::new(crate::store::Store::default_root());
     let effective = if let Some(id) = fork {
-        let cwd = std::env::current_dir()?;
+        // A CLI fork is "the same conversation, new branch": the fork head
+        // carries the source's model/provider/cwd (read-only, no open —
+        // `open` would truncate a torn source tail, which fork must not
+        // repair). started_at stays now: the branch starts when forked.
+        let source_head = store
+            .head(&id)
+            .map_err(|e| anyhow::anyhow!("{e} (see buran sessions list)"))?;
         let new_file = store
             .fork(
                 &id,
                 crate::session::TranscriptMeta {
-                    model: String::new(),
-                    provider: String::new(),
+                    model: source_head.model,
+                    provider: source_head.provider,
                     started_at: crate::store::rfc3339_now(),
                     ended_at: None,
-                    cwd,
+                    cwd: source_head.cwd,
                     forked_from: None, // store.fork sets the lineage
                 },
             )

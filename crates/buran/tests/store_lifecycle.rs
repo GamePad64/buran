@@ -91,6 +91,46 @@ fn remove_deletes_the_file_and_notfound_on_repeat() {
 }
 
 #[test]
+fn head_reads_the_source_meta_without_touching_the_file() {
+    // The pre-flight read for --fork: one head_meta line-read, no open()
+    // (which would truncate a torn source tail — fork repairs nothing).
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let mut orig = store.create(meta("/proj")).unwrap();
+    let original_bytes = bytes_of(&dir, orig.id());
+    orig.append(&TranscriptRecord::Message(ChatMessage::user("q")))
+        .unwrap();
+
+    let head = store.head(orig.id()).unwrap();
+    assert_eq!(head.model, "m");
+    assert_eq!(head.provider, "p");
+    assert_eq!(head.cwd, std::path::Path::new("/proj"));
+
+    // A torn final line on top of the appended body must not be repaired
+    // by a head() read: the file keeps every byte it had.
+    let path = dir.path().join(format!("{}.jsonl", orig.id()));
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    write!(file, "{{\"torn\"").unwrap();
+    drop(file);
+    let before = std::fs::read(&path).unwrap();
+    let _ = store.head(orig.id()).unwrap();
+    assert_eq!(before, std::fs::read(&path).unwrap(), "head() never writes");
+
+    assert!(
+        matches!(
+            store.head("01940000-0000-7000-8000-000000000009"),
+            Err(buran::store::StoreError::NotFound(_))
+        ),
+        "unknown id is NotFound"
+    );
+    let _ = original_bytes;
+}
+
+#[test]
 fn fork_of_a_corrupt_source_leaves_no_orphan_session_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(dir.path());
