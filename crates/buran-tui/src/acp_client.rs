@@ -232,15 +232,12 @@ impl AcpClient {
         resume: Option<String>,
         fork: Option<String>,
     ) -> anyhow::Result<Self> {
-        // The fork target for the client's own load: the agent mints the
-        // fork id server-side and the TUI cannot read it from the child's
-        // stderr, so the client resumes "latest" — resolved HERE against
-        // the store directory (shared-HOME contract, see
-        // `latest_session_id`), before any process spawns so an empty
-        // store fails before a terminal is claimed.
+        // What the client itself loads: an explicit non-"latest" id is
+        // known now; "latest" (bare --resume, or --fork whose target id
+        // the agent mints server-side) resolves LATER — see main_fn.
         let load_target = match (&resume, &fork) {
             (Some(id), _) if id != "latest" => Some(id.clone()),
-            (_, Some(_)) | (Some(_), None) => Some(latest_session_id()?),
+            (_, Some(_)) | (Some(_), None) => Some(String::from("latest")),
             (None, None) => None,
         };
         // The fluent `.args()` (an APPEND, `self.args.extend`) lives on
@@ -372,26 +369,41 @@ impl AcpClient {
                     // without an external fs MCP server the model simply has
                     // no fs tools — honest degradation, no crash.
                     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                    // Resume: `session/load` attaches to the stored
-                    // conversation; replay notifications sent before the
-                    // load response arrive through the builder-level
-                    // notification handler (user handlers run before the
-                    // SDK's session route), so the transcript rebuilds in
-                    // the UI before the first prompt. The response's
-                    // session id IS the loaded id.
+                    // "latest" resolves here, AFTER initialize: initialize
+                    // returns only once the child has finished its pre-ACP
+                    // work, so under `--fork` the minted fork file (the
+                    // newest uuidv7) is already in the shared-HOME store.
+                    // Resolving before spawn would read the SOURCE id and
+                    // resume the original transcript, defeating the fork.
+                    // Shared-HOME contract, see `latest_session_id`.
                     let session_id = match load_target {
-                        Some(id) => match connection
-                            .load_session(SessionId::new(id), cwd.clone())
-                            .block_task()
-                            .start_session()
-                            .await
-                        {
-                            Ok(setup) => setup.session.session_id().clone(),
-                            Err(error) => {
-                                main_fn_reporter.report(format!("session/load failed: {error}"));
-                                return Err(error);
+                        Some(target) => {
+                            let id = if target == "latest" {
+                                latest_session_id()?
+                            } else {
+                                target
+                            };
+                            // Resume: `session/load` attaches to the stored
+                            // conversation; replay notifications sent before
+                            // the load response arrive through the
+                            // builder-level notification handler (user
+                            // handlers run before the SDK's session route),
+                            // so the transcript rebuilds in the UI before the
+                            // first prompt. The loaded id IS the session id.
+                            match connection
+                                .load_session(SessionId::new(id), cwd.clone())
+                                .block_task()
+                                .start_session()
+                                .await
+                            {
+                                Ok(setup) => setup.session.session_id().clone(),
+                                Err(error) => {
+                                    main_fn_reporter
+                                        .report(format!("session/load failed: {error}"));
+                                    return Err(error);
+                                }
                             }
-                        },
+                        }
                         None => match connection
                             .send_request(NewSessionRequest::new(cwd))
                             .block_task()
