@@ -14,9 +14,10 @@ use agent_client_protocol::{
     v1::ConnectionTo,
     v1::schema::{
         AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-        InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-        SessionId, SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall,
-        ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionNotification,
+        SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     },
 };
 use tokio::sync::{mpsc, watch};
@@ -154,6 +155,7 @@ fn build_agent(
     // Each handler captures its own Arc clone: registrations move their
     // captures, and one Arc cannot feed three `async move` closures.
     let state_new_session = state.clone();
+    let state_load = state.clone();
     let state_prompt = state.clone();
     let state_cancel = state.clone();
     let provider_new_session = provider.clone();
@@ -166,7 +168,7 @@ fn build_agent(
             async |req: InitializeRequest, responder, _cx| {
                 responder.respond(
                     InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new()),
+                        .agent_capabilities(AgentCapabilities::new().load_session(true)),
                 )
             },
             on_receive_request!(),
@@ -231,6 +233,77 @@ fn build_agent(
                         },
                     );
                 responder.respond(NewSessionResponse::new(session_id))
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: LoadSessionRequest, responder, _cx| {
+                let load_result = (|| -> anyhow::Result<SessionHandle> {
+                    // Store read happens BEFORE the sessions lock: file I/O must
+                    // not hold the lock; it guards only the map insert.
+                    let (file, records) = state_load
+                        .store
+                        .open(&req.session_id.0)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let head = records
+                        .first()
+                        .and_then(|r| match r {
+                            crate::session::TranscriptRecord::Metadata(m) => Some(m.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("transcript has no metadata head"))?;
+                    if head.cwd != req.cwd {
+                        anyhow::bail!(
+                            "cwd mismatch: session was created in {}, request is {} \
+                             (sessions resume only in their original directory)",
+                            head.cwd.display(),
+                            req.cwd.display()
+                        );
+                    }
+                    let mut history = Vec::new();
+                    let mut compaction_points = Vec::new();
+                    for record in &records {
+                        match record {
+                            crate::session::TranscriptRecord::Message(m) => history.push(m.clone()),
+                            crate::session::TranscriptRecord::CompactionPoint {
+                                at_message,
+                                ..
+                            } => compaction_points.push(*at_message),
+                            crate::session::TranscriptRecord::Metadata(_) => {}
+                        }
+                    }
+                    Ok(SessionHandle {
+                        system_prompt: build_system_prompt(
+                            &req.cwd,
+                            &state_load.config.skills_dirs,
+                        ),
+                        skills: crate::skills::scan(&state_load.config.skills_dirs),
+                        session: SessionState {
+                            history,
+                            compaction_points,
+                        },
+                        cancel_tx: watch::channel(false).0,
+                        turn_in_flight: false,
+                        store_file: Some(file),
+                    })
+                })();
+                match load_result {
+                    Ok(handle) => {
+                        state_load
+                            .sessions
+                            .lock()
+                            .expect("sessions lock")
+                            .insert(req.session_id.clone(), handle);
+                        let _ = responder.respond(LoadSessionResponse::new());
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(agent_client_protocol::Error::new(
+                            agent_client_protocol::ErrorCode::INVALID_PARAMS,
+                            format!("{e}"),
+                        ));
+                    }
+                }
+                Ok::<(), agent_client_protocol::Error>(())
             },
             on_receive_request!(),
         )

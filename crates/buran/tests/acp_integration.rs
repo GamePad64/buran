@@ -1006,3 +1006,199 @@ async fn a_store_create_failure_does_not_kill_the_session() {
         .expect("integration test timed out")
         .expect("ACP connection failed");
 }
+
+/// `session/load` rebuilds the conversation from the transcript: a session
+/// created and driven by one connection is resumed by another (the in-process
+/// equivalent of a second process — state lives in the store), and the
+/// continuation LLM request carries the pre-restart history.
+#[tokio::test(flavor = "current_thread")]
+async fn load_session_replays_history_and_continues_the_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    // Process 1: one turn records a magic word into the store.
+    let m = MockTransport::new();
+    let turn1 = format!(
+        "data: {}\n\n{}",
+        text_chunk("the magic word is FROB"),
+        stop_and_done()
+    );
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    let m2 = m.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let stored_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored_id1 = stored_id.clone();
+    let cwd1 = cwd.clone();
+    let client1 = Client.v1().connect_with(agent, move |cx| {
+        let stored_id = stored_id1.clone();
+        let cwd = cwd1.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx
+                .build_session(cwd.clone())
+                .block_task()
+                .start_session()
+                .await?;
+            *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
+            session.send_prompt("say the magic word")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client1)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+    let id = stored_id
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("session id captured");
+
+    // Process 2 (fresh agent over the same store): loadSession + prompt.
+    // The scripted reply is empty of information; the real assertion is on
+    // the continuation REQUEST: only a correctly rebuilt history can put
+    // the pre-restart text into it.
+    let m = MockTransport::new();
+    let turn2 = format!("data: {}\n\n{}", text_chunk("FROB"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m3.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder 2");
+
+    let client2 = Client.v1().connect_with(agent, move |cx| {
+        let id = id.clone();
+        let cwd = cwd.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } = cx
+                .load_session(id, cwd)
+                .block_task()
+                .start_session()
+                .await?;
+            session.send_prompt("what was the magic word?")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client2)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+
+    // The continuation request must carry the pre-restart history.
+    let requests = m2.requests();
+    assert!(!requests.is_empty());
+    assert!(
+        body_contains(&requests.last().unwrap(), "the magic word is FROB"),
+        "resumed conversation's LLM request must contain pre-restart history"
+    );
+}
+
+/// Unknown session id and cwd mismatch both fail `session/load`; the errors
+/// name what went wrong (the id) and, for a cwd mismatch, both paths.
+#[tokio::test(flavor = "current_thread")]
+async fn load_session_unknown_id_errors_and_cwd_mismatch_names_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let m = MockTransport::new();
+    let turn1 = format!("data: {}\n\n{}", text_chunk("x"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    let m2 = m.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let stored_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored_id1 = stored_id.clone();
+    let cwd1 = cwd.clone();
+    let client = Client.v1().connect_with(agent, move |cx| {
+        let stored_id = stored_id1.clone();
+        let cwd = cwd1.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx
+                .build_session(cwd.clone())
+                .block_task()
+                .start_session()
+                .await?;
+            *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
+            session.send_prompt("x")?;
+            let _ = session.read_to_string().await?;
+
+            // Unknown id: start_session must return an error naming the id.
+            let unknown = cx
+                .load_session("01940000-0000-7000-8000-does-not-exist", cwd.clone())
+                .block_task()
+                .start_session()
+                .await;
+            let err = match unknown {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("unknown session id must fail the load"),
+            };
+            assert!(
+                err.contains("not found") || err.contains("01940000"),
+                "{err}"
+            );
+
+            // Real id, wrong cwd: the error must name both paths.
+            let wrong = cx
+                .load_session(
+                    stored_id.lock().unwrap().clone().unwrap(),
+                    std::path::PathBuf::from("/some/other/cwd"),
+                )
+                .block_task()
+                .start_session()
+                .await;
+            let err = match wrong {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("cwd mismatch must fail the load"),
+            };
+            assert!(
+                err.contains("/some/other/cwd"),
+                "must name request cwd: {err}"
+            );
+            let real_cwd = cwd.display().to_string();
+            assert!(err.contains(&real_cwd), "must name session cwd: {err}");
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+}
