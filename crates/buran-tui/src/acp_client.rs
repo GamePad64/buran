@@ -104,12 +104,19 @@ impl PermissionQuestion {
     }
 }
 
-/// One UI event: assistant text, or a permission question. The UI is a
-/// plain `select!` over this stream, key events, and the turn handle.
+/// One UI event: assistant text, replayed user text, or a permission
+/// question. The UI is a plain `select!` over this stream, key events,
+/// and the turn handle.
 #[derive(Debug)]
 pub enum ClientEvent {
     /// Assistant message text.
     Text(String),
+    /// User message text — seen only on the `session/load` replay path,
+    /// where the agent re-sends prior turns as `UserMessageChunk` before
+    /// the load response. Distinct from [`ClientEvent::Text`] so the
+    /// transcript renders resumed user turns as the user's, not the
+    /// assistant's.
+    UserText(String),
     /// The agent asks which option to take; the UI answers through the
     /// question's `answer` method.
     Question(PermissionQuestion),
@@ -141,6 +148,43 @@ pub fn serve_args(resume: Option<String>, fork: Option<String>) -> Vec<String> {
         args.push(id);
     }
     args
+}
+
+/// Store root read from `$HOME` — the same XDG path `Store::default_root`
+/// computes server-side. Resolving "latest" TUI-locally duplicates that
+/// rule on purpose: the TUI crate has no dependency on the buran store
+/// module (the ACP stdio seam is the contract), and the v1.5 model is one
+/// process on one machine — TUI and spawned `serve` share `$HOME`, so a
+/// max-filename listing sees exactly the store the agent sees. Cross-machine
+/// resume (remote agent, separate store) is a spec non-goal.
+fn store_root() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join(".local/state/buran/sessions")
+}
+
+/// Max `.jsonl` stem in the sessions store — the `Store::latest` rule
+/// (uuidv7 sorts lexicographically == chronologically) mirrored without a
+/// crate dependency. `Err` when the store is missing or has no sessions:
+/// resuming nothing must fail loudly, not silently start a fresh session.
+fn latest_session_id() -> anyhow::Result<String> {
+    latest_session_id_in(store_root())
+}
+
+/// The max-stem scan itself, rooted at an explicit directory so tests can
+/// point it at a tempdir instead of the real HOME.
+fn latest_session_id_in(root: std::path::PathBuf) -> anyhow::Result<String> {
+    let max = std::fs::read_dir(&root)
+        .map_err(|e| anyhow::anyhow!("no stored sessions to resume ({}: {e})", root.display()))?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".jsonl").map(str::to_owned)
+        })
+        .max();
+    match max {
+        Some(id) => Ok(id),
+        None => anyhow::bail!("no stored sessions to resume ({})", root.display()),
+    }
 }
 
 /// The ready-signal slot: a take-once oneshot sender shared by the
@@ -175,14 +219,30 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
-    /// Spawns the agent command, initializes, opens a session in the
-    /// current directory. Fails loudly when the handshake does not
+    /// Spawns the agent command, initializes, and opens a session — fresh,
+    /// or (with `resume`/`fork`) attached to a stored conversation via
+    /// `session/load`, whose replayed `session/update` notifications flow
+    /// through the same event stream as live turns. `fork` makes the
+    /// AGENT copy-on-start the transcript; the TUI then resumes the minted
+    /// fork, which it finds as "latest" (a fork file is the newest uuidv7
+    /// in the shared-HOME store). Fails loudly when the handshake does not
     /// complete: a TUI failing only at the first prompt looks like a hang.
     pub async fn spawn(
         agent_command: &str,
         resume: Option<String>,
         fork: Option<String>,
     ) -> anyhow::Result<Self> {
+        // The fork target for the client's own load: the agent mints the
+        // fork id server-side and the TUI cannot read it from the child's
+        // stderr, so the client resumes "latest" — resolved HERE against
+        // the store directory (shared-HOME contract, see
+        // `latest_session_id`), before any process spawns so an empty
+        // store fails before a terminal is claimed.
+        let load_target = match (&resume, &fork) {
+            (Some(id), _) if id != "latest" => Some(id.clone()),
+            (_, Some(_)) | (Some(_), None) => Some(latest_session_id()?),
+            (None, None) => None,
+        };
         // The fluent `.args()` (an APPEND, `self.args.extend`) lives on
         // `AcpAgentConfig`, not on `AcpAgent` itself: round-trip through
         // the config to add the selection flags after whatever `from_str`
@@ -223,13 +283,27 @@ impl AcpClient {
                 .name("buran-tui")
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx| {
-                        if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
-                            && let ContentBlock::Text(text) = chunk.content
-                        {
-                            // A closed sink only means the UI stopped
-                            // reading (e.g. the app already exited);
-                            // dropping the chunk is correct there.
-                            let _ = event_tx_chunk.send(ClientEvent::Text(text.text)).await;
+                        // Text chunks, live or replayed (session/load sends
+                        // prior turns back as updates before the load
+                        // response). Tool-call and other update variants
+                        // are ignored — v1.5 replay scope is text.
+                        match notification.update {
+                            SessionUpdate::AgentMessageChunk(chunk) => {
+                                if let ContentBlock::Text(text) = chunk.content {
+                                    // A closed sink only means the UI
+                                    // stopped reading (e.g. the app
+                                    // already exited); dropping the chunk
+                                    // is correct there.
+                                    let _ = event_tx_chunk.send(ClientEvent::Text(text.text)).await;
+                                }
+                            }
+                            SessionUpdate::UserMessageChunk(chunk) => {
+                                if let ContentBlock::Text(text) = chunk.content {
+                                    let _ =
+                                        event_tx_chunk.send(ClientEvent::UserText(text.text)).await;
+                                }
+                            }
+                            _ => {}
                         }
                         Ok(())
                     },
@@ -297,22 +371,42 @@ impl AcpClient {
                     // Deliberately no fs capability (default capabilities):
                     // without an external fs MCP server the model simply has
                     // no fs tools — honest degradation, no crash.
-                    let new_session = match connection
-                        .send_request(NewSessionRequest::new(
-                            std::env::current_dir().unwrap_or_else(|_| ".".into()),
-                        ))
-                        .block_task()
-                        .await
-                    {
-                        Ok(session) => session,
-                        Err(error) => {
-                            main_fn_reporter.report(format!("session/new failed: {error}"));
-                            return Err(error);
-                        }
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                    // Resume: `session/load` attaches to the stored
+                    // conversation; replay notifications sent before the
+                    // load response arrive through the builder-level
+                    // notification handler (user handlers run before the
+                    // SDK's session route), so the transcript rebuilds in
+                    // the UI before the first prompt. The response's
+                    // session id IS the loaded id.
+                    let session_id = match load_target {
+                        Some(id) => match connection
+                            .load_session(SessionId::new(id), cwd.clone())
+                            .block_task()
+                            .start_session()
+                            .await
+                        {
+                            Ok(setup) => setup.session.session_id().clone(),
+                            Err(error) => {
+                                main_fn_reporter.report(format!("session/load failed: {error}"));
+                                return Err(error);
+                            }
+                        },
+                        None => match connection
+                            .send_request(NewSessionRequest::new(cwd))
+                            .block_task()
+                            .await
+                        {
+                            Ok(session) => session.session_id,
+                            Err(error) => {
+                                main_fn_reporter.report(format!("session/new failed: {error}"));
+                                return Err(error);
+                            }
+                        },
                     };
 
                     if let Some(ready_tx) = ready_slot.lock().unwrap().take() {
-                        let _ = ready_tx.send(Ok((connection.clone(), new_session.session_id)));
+                        let _ = ready_tx.send(Ok((connection.clone(), session_id)));
                     }
 
                     // Park until the process exits: returning tears the
@@ -397,5 +491,31 @@ impl TurnHandle {
         (&mut self.stop_rx)
             .await
             .map_err(|error| anyhow::anyhow!("turn channel closed: {error}"))?
+    }
+}
+
+#[cfg(test)]
+mod latest_resolution_tests {
+    use super::latest_session_id_in;
+
+    #[test]
+    fn max_jsonl_stem_wins_and_missing_or_empty_store_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Missing directory: loud error, never a silent fresh session.
+        assert!(latest_session_id_in(root.join("nonexistent")).is_err());
+
+        // Empty directory: same.
+        assert!(latest_session_id_in(root.clone()).is_err());
+
+        // Non-.jsonl files don't count; max stem wins.
+        std::fs::write(root.join("01940000-0000-7000-8000-000000000001.jsonl"), "").unwrap();
+        std::fs::write(root.join("01940000-0000-7000-8000-000000000002.jsonl"), "").unwrap();
+        std::fs::write(root.join("notes.txt"), "").unwrap();
+        assert_eq!(
+            latest_session_id_in(root).unwrap(),
+            "01940000-0000-7000-8000-000000000002"
+        );
     }
 }

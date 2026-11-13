@@ -107,3 +107,56 @@ async fn second_prompt_reuses_the_session() {
 fn shell_quote(script: &str) -> String {
     format!("'{}'", script.replace('\'', r#"'\''"#))
 }
+
+/// Fake that advertises loadSession capability and, on session/load, emits
+/// a UserMessageChunk replay before answering the load response. This
+/// exercises the TUI client's resume path and the UserText forwarding.
+fn fake_agent_script_with_load_replay() -> String {
+    r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | sed 's/.*"sessionId":"\([^"]*\)".*/\1/')
+      # Replay a prior user turn as the server does on loadSession.
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"prior user turn"}}}}\n' "$sid"
+      printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+    .to_string()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn client_loads_session_and_surfaces_replayed_user_text() {
+    let client = AcpClient::spawn(
+        &format!(
+            "bash -c {}",
+            shell_quote(&fake_agent_script_with_load_replay())
+        ),
+        Some("fake-sess-xyz".into()),
+        None,
+    )
+    .await
+    .expect("spawn + initialize + loadSession against fake agent");
+
+    // The UserMessageChunk replay should arrive via the unified event stream
+    // and be forwarded as ClientEvent::UserText (distinct from assistant Text).
+    let event = tokio::time::timeout(TIMEOUT, client.next_event())
+        .await
+        .expect("replay event timed out")
+        .expect("agent connection closed before the replay chunk arrived");
+    let ClientEvent::UserText(text) = event else {
+        panic!("expected UserText replay chunk, got {event:?}");
+    };
+    assert_eq!(text, "prior user turn");
+
+    client.shutdown();
+}

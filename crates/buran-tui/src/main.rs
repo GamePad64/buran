@@ -113,6 +113,12 @@ async fn run_app(
                     app.append_assistant(&chunk);
                     Step::Continue
                 }
+                // Replayed prior user turn (session/load): rendered as a
+                // user line, never merged into assistant text.
+                Some(ClientEvent::UserText(chunk)) => {
+                    app.push_user(&chunk);
+                    Step::Continue
+                }
                 Some(ClientEvent::Question(question)) => {
                     app.question = Some(question);
                     Step::Continue
