@@ -212,6 +212,3 @@ The string "rva23" is recorded exactly as provided; the actual Rust target tripl
 - Background health monitoring for MCP (vs pure on-call restart).
 - Any TUI affordance for mode display or switching (explicit non-goal for v1.5.1).
 
----
-
-This spec captures the conversational design that received "lgtm". It is now ready for user review of the written document before any implementation plan is written.
