@@ -27,6 +27,20 @@ struct Cli {
     /// Agent command to spawn (defaults to `buran serve` from PATH).
     #[arg(long, default_value = "buran serve")]
     agent: String,
+    /// Resume a stored session: an id, or "latest"; bare `--resume`
+    /// means "latest". (Attach is completed by the client via
+    /// session/loadSession.)
+    #[arg(
+        long,
+        default_missing_value = "latest",
+        require_equals = false,
+        num_args = 0..=1
+    )]
+    resume: Option<String>,
+    /// Fork a stored session (copy-on-start) and resume the fork.
+    /// Conflicts with `--resume`.
+    #[arg(long, conflicts_with = "resume")]
+    fork: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -44,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .try_init();
 
     let mut terminal = setup_terminal().context("failed to enter TUI mode")?;
-    let result = run_app(&mut terminal, &cli.agent).await;
+    let result = run_app(&mut terminal, &cli.agent, cli.resume, cli.fork).await;
     restore_terminal(&mut terminal)?;
 
     result
@@ -63,8 +77,10 @@ enum Step {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     agent_command: &str,
+    resume: Option<String>,
+    fork: Option<String>,
 ) -> anyhow::Result<()> {
-    let client = AcpClient::spawn(agent_command).await?;
+    let client = AcpClient::spawn(agent_command, resume, fork).await?;
     let mut app = App::default();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Event>(32);
     spawn_key_reader(key_tx);

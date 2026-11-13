@@ -123,6 +123,26 @@ const PERMISSION_UI_TIMEOUT: Duration = Duration::from_secs(120);
 /// looks like a hang, so `spawn` fails loudly instead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Selection flags appended to the spawned agent command. Pure so the
+/// arg shape is testable without spawning the agent. Returns ONLY the
+/// flags — the `serve` subcommand itself already sits in the agent's
+/// arg list: the user's `--agent` string (default "buran serve") went
+/// through `AcpAgent::from_str`, and the SDK's `args()` APPENDS
+/// (`self.args.extend`), so returning a "serve" prefix here would spawn
+/// `buran serve serve --resume ...`.
+pub fn serve_args(resume: Option<String>, fork: Option<String>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(id) = resume {
+        args.push("--resume".into());
+        args.push(id);
+    }
+    if let Some(id) = fork {
+        args.push("--fork".into());
+        args.push(id);
+    }
+    args
+}
+
 /// The ready-signal slot: a take-once oneshot sender shared by the
 /// main_fn and the connection task.
 type ReadySlot = Arc<
@@ -158,8 +178,20 @@ impl AcpClient {
     /// Spawns the agent command, initializes, opens a session in the
     /// current directory. Fails loudly when the handshake does not
     /// complete: a TUI failing only at the first prompt looks like a hang.
-    pub async fn spawn(agent_command: &str) -> anyhow::Result<Self> {
-        let agent = AcpAgent::from_str(agent_command)?;
+    pub async fn spawn(
+        agent_command: &str,
+        resume: Option<String>,
+        fork: Option<String>,
+    ) -> anyhow::Result<Self> {
+        // The fluent `.args()` (an APPEND, `self.args.extend`) lives on
+        // `AcpAgentConfig`, not on `AcpAgent` itself: round-trip through
+        // the config to add the selection flags after whatever `from_str`
+        // shell-split out of the user's `--agent` string.
+        let agent = AcpAgent::new(
+            AcpAgent::from_str(agent_command)?
+                .into_config()
+                .args(serve_args(resume, fork)),
+        );
 
         let (event_tx, event_rx) = mpsc::channel::<ClientEvent>(256);
         // Each handler registration moves its own clone (AsyncFnMut

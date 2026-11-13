@@ -84,6 +84,19 @@ Project instructions, read automatically (the way Claude Code reads CLAUDE.md). 
 
 On first run, `buran doctor` detects an empty MCP configuration and offers **ACT** (MCP-over-stdio) as the ready-made tool set — including its filesystem component, which is the way buran gets file tools (there is no bundled fs server; all tools are external, by design). The offer prints the ready-to-paste config line; the harness itself has no ACT-specific code.
 
+## Sessions
+
+Every conversation persists as an append-only JSONL transcript in `~/.local/state/buran/sessions/`, named by its UUIDv7 id (filename order = chronological order; ADR 0007: the directory listing is the catalog — no index, no SQLite).
+
+```sh
+buran sessions list            # id, started_at, model, forked_from
+buran-tui --resume latest      # most recent session
+buran-tui --fork <id>          # branch; the original is never touched
+buran sessions rm <id>         # delete
+```
+
+Resume semantics: `serve` validates the id before the ACP channel opens; a client then attaches to the stored conversation via `session/loadSession` (cwd must match the session's recorded cwd). A torn final line (crash mid-append) replays up to the last good line; unknown record types are skipped for forward compatibility.
+
 ## ACP contract
 
 `buran serve` speaks ACP over stdio (`initialize` → `newSession` → `prompt` → streamed `session/update`, with `session/request_permission` for tool calls). Clients declare their capabilities at `initialize`; a client without fs capability simply gets a catalog without fs tools — honest degradation, no crash, no bundled fallback.

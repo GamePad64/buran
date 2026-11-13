@@ -47,9 +47,13 @@ done
 
 #[tokio::test(flavor = "current_thread")]
 async fn client_streams_chunks_and_returns_stop_reason() {
-    let client = AcpClient::spawn(&format!("bash -c {}", shell_quote(&fake_agent_script())))
-        .await
-        .expect("spawn + initialize + newSession against fake agent");
+    let client = AcpClient::spawn(
+        &format!("bash -c {}", shell_quote(&fake_agent_script())),
+        None,
+        None,
+    )
+    .await
+    .expect("spawn + initialize + newSession against fake agent");
 
     let mut turn = client.prompt_detached("hi".into());
     let stop = tokio::time::timeout(TIMEOUT, turn.stop_reason())
@@ -74,9 +78,13 @@ async fn client_streams_chunks_and_returns_stop_reason() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn second_prompt_reuses_the_session() {
-    let client = AcpClient::spawn(&format!("bash -c {}", shell_quote(&fake_agent_script())))
-        .await
-        .expect("spawn");
+    let client = AcpClient::spawn(
+        &format!("bash -c {}", shell_quote(&fake_agent_script())),
+        None,
+        None,
+    )
+    .await
+    .expect("spawn");
 
     let mut first = client.prompt_detached("one".into());
     let first_stop = tokio::time::timeout(TIMEOUT, first.stop_reason())
