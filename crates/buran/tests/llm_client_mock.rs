@@ -26,6 +26,54 @@ fn sse_body() -> Vec<&'static str> {
     ]
 }
 
+/// A usage-only final chunk must be observable after the stream drains:
+/// the hardening spec's usage recording starts here.
+#[tokio::test]
+async fn last_usage_is_available_after_final_chunk() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response_frames(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(vec![
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+                "data: [DONE]\n\n",
+            ])
+            .unwrap(),
+    );
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+    while let Some(ev) = s.next().await.unwrap() {
+        let _ = ev;
+    }
+    let u = s.last_usage().expect("usage must be present");
+    assert_eq!(u.prompt_tokens, 5);
+    assert_eq!(u.completion_tokens, 3);
+    assert_eq!(u.total_tokens, 8);
+}
+
+/// No usage chunk → `last_usage` stays None (no record should be written).
+#[tokio::test]
+async fn last_usage_is_none_without_usage_chunk() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response_frames(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(sse_body())
+            .unwrap(),
+    );
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+    while let Some(ev) = s.next().await.unwrap() {
+        let _ = ev;
+    }
+    assert!(s.last_usage().is_none());
+}
+
 #[tokio::test]
 async fn streams_deltas_then_done_over_mock() {
     let m = hclient::mock::MockTransport::new();

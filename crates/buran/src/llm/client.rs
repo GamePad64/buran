@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use hclient::sse::{DEFAULT_MAX_EVENT_SIZE, SseEvent, SseStream};
 
-use super::types::{ApiErrorBody, ChatChunk, ChatRequest, FinishReason};
+use super::types::{ApiErrorBody, ChatChunk, ChatRequest, FinishReason, Usage};
 use crate::config::ProviderConfig;
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +46,9 @@ pub enum ChatEvent {
 pub struct ChatStream {
     sse: SseStream<hclient::body::ClientBody>,
     last_finish_reason: Option<FinishReason>,
+    /// Last observed `usage` chunk (hardening v1.5.1): OpenAI-compatible
+    /// endpoints send it on the final chunk; "last wins" across chunks.
+    last_usage: Option<Usage>,
     done: bool,
     /// Tool-call deltas parsed from a chunk but not yet yielded: `next()`
     /// returns one event per call, and one chunk may carry several.
@@ -53,6 +56,13 @@ pub struct ChatStream {
 }
 
 impl ChatStream {
+    /// The last observed `usage` chunk, if any (hardening v1.5.1). Safe to
+    /// call after the stream is drained; `None` when the endpoint sent no
+    /// usage (no record gets written).
+    pub fn last_usage(&self) -> Option<Usage> {
+        self.last_usage
+    }
+
     /// Next event, or `None` once the stream has finished (`[DONE]` seen,
     /// or the connection closed). [`ChatEvent::Done`] is delivered exactly
     /// once; every call after it returns `None`.
@@ -85,6 +95,9 @@ impl ChatStream {
                         return Ok(Some(ChatEvent::Done(self.last_finish_reason)));
                     }
                     let chunk: ChatChunk = serde_json::from_str(&data)?;
+                    if let Some(usage) = chunk.usage {
+                        self.last_usage = Some(usage);
+                    }
                     for choice in chunk.choices {
                         if choice.finish_reason.is_some() {
                             self.last_finish_reason = choice.finish_reason;
@@ -193,6 +206,7 @@ impl LlmClient {
         Ok(ChatStream {
             sse,
             last_finish_reason: None,
+            last_usage: None,
             done: false,
             pending: VecDeque::new(),
         })
