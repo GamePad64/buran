@@ -259,7 +259,7 @@ fn build_agent(
             on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: LoadSessionRequest, responder, _cx| {
+            async move |req: LoadSessionRequest, responder, cx| {
                 let load_result = (|| -> anyhow::Result<SessionHandle> {
                     // Store read happens BEFORE the sessions lock: file I/O must
                     // not hold the lock; it guards only the map insert.
@@ -318,6 +318,49 @@ fn build_agent(
                 })();
                 match load_result {
                     Ok(handle) => {
+                        // Replay the conversation to the CLIENT before the
+                        // load response: the TUI picker and `--resume`
+                        // render history from these notifications. The
+                        // replay carries what SessionState.history holds
+                        // (post-compaction view once compaction exists;
+                        // today that is every stored message). The SDK
+                        // routes notifications for this session to the
+                        // restored session's stream even before the
+                        // response is dispatched, so order survives.
+                        // Send failure degrades: a dead connection makes
+                        // the response moot anyway — but a notification
+                        // error does NOT abort the load; the session is
+                        // live and the next prompt works.
+                        for message in &handle.session.history {
+                            let update = match message.role {
+                                crate::llm::types::Role::User => {
+                                    let Some(content) = message.content.as_deref() else {
+                                        continue;
+                                    };
+                                    SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(content.to_string())),
+                                    ))
+                                }
+                                crate::llm::types::Role::Assistant
+                                    if let Some(content) = message.content.as_deref() =>
+                                {
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(content.to_string())),
+                                    ))
+                                }
+                                // Tool traffic is bookkeeping between the
+                                // agent and its tools, not prose the user
+                                // reads; tool-call updates have their own
+                                // wire types and are not reconstructed here
+                                // (v1.5 replay scope is text, matching the
+                                // client's handler).
+                                _ => continue,
+                            };
+                            let _ = cx.send_notification(SessionNotification::new(
+                                req.session_id.clone(),
+                                update,
+                            ));
+                        }
                         state_load
                             .sessions
                             .lock()

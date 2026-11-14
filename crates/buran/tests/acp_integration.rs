@@ -1118,6 +1118,144 @@ async fn load_session_replays_history_and_continues_the_conversation() {
     );
 }
 
+/// `session/load` replays the stored conversation to the CLIENT as
+/// `session/update` notifications (user and assistant turns) BEFORE the
+/// load response — the TUI picker and `--resume` render history from
+/// these; without them a resumed view starts empty. Assistant text
+/// arrives as `agent_message_chunk`; user turns as `user_message_chunk`.
+#[tokio::test(flavor = "current_thread")]
+async fn load_session_replays_conversation_to_the_client_before_the_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    // Process 1: user says "remember CAKE", assistant replies "cake noted".
+    let m = MockTransport::new();
+    let turn1 = format!("data: {}\n\n{}", text_chunk("cake noted"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    let m2 = m.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let stored_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored_id1 = stored_id.clone();
+    let cwd1 = cwd.clone();
+    let client1 = Client.v1().connect_with(agent, move |cx| {
+        let stored_id = stored_id1.clone();
+        let cwd = cwd1.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx
+                .build_session(cwd.clone())
+                .block_task()
+                .start_session()
+                .await?;
+            *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
+            session.send_prompt("remember CAKE")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client1)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+    let id = stored_id.lock().unwrap().clone().expect("session id");
+
+    // Process 2: load and collect every notification that arrives before
+    // the load RESPONSE resolves. The SDK buffers pre-response routing on
+    // the restored session, so reading updates after start_session still
+    // sees the replay in order.
+    let m = MockTransport::new();
+    let turn2 = format!("data: {}\n\n{}", text_chunk("ok"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder 2");
+
+    let client2 = Client.v1().connect_with(agent, move |cx| {
+        let id = id.clone();
+        let cwd = cwd.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } = cx
+                .load_session(id, cwd)
+                .block_task()
+                .start_session()
+                .await?;
+
+            // Drain updates until the first prompt response would arrive;
+            // there is no prompt in flight, so everything seen here is the
+            // replay. Two text updates expected: the user turn, then the
+            // assistant reply.
+            let mut seen: Vec<(bool, String)> = Vec::new(); // (is_user, text)
+            for _ in 0..10 {
+                let message = session.read_update().await?;
+                if let Some(notification) = as_notification(message) {
+                    match notification.update {
+                        SessionUpdate::UserMessageChunk(chunk) => {
+                            seen.push((true, text_of(&chunk)));
+                        }
+                        SessionUpdate::AgentMessageChunk(chunk) => {
+                            seen.push((false, text_of(&chunk)));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // A prompt response (or non-notification): the replay
+                    // stream is over.
+                    break;
+                }
+                if seen.len() >= 2 {
+                    break;
+                }
+            }
+
+            assert!(
+                seen.contains(&(true, "remember CAKE".to_string())),
+                "user turn must replay as user_message_chunk: {seen:?}"
+            );
+            assert!(
+                seen.contains(&(false, "cake noted".to_string())),
+                "assistant turn must replay as agent_message_chunk: {seen:?}"
+            );
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client2)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+}
+
+/// The text carried by a message-chunk update (helper; chunks are
+/// ContentChunk with a text ContentBlock).
+fn text_of(chunk: &agent_client_protocol::v1::schema::ContentChunk) -> String {
+    match &chunk.content {
+        agent_client_protocol::v1::schema::ContentBlock::Text(t) => t.text.clone(),
+        _ => String::new(),
+    }
+}
+
 /// Unknown session id and cwd mismatch both fail `session/load`; the errors
 /// name what went wrong (the id) and, for a cwd mismatch, both paths.
 #[tokio::test(flavor = "current_thread")]
