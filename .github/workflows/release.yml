@@ -61,11 +61,16 @@ jobs:
       # zig (the compiler, not just the cargo wrapper) is required by
       # cargo zigbuild; taiki-e/install-action installs cargo-zigbuild
       # only, and the first release run died with "Failed to find zig".
-      - name: Install zig + cargo-zigbuild (all Linux musl targets)
+      # install-action also cannot install zig itself ("does not support
+      # zig"; second run), so the compiler comes from setup-zig.
+      - name: Install zig (all Linux musl targets)
+        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
+        uses: mlugg/setup-zig@v1
+      - name: Install cargo-zigbuild (all Linux musl targets)
         if: runner.os == 'Linux' && contains(matrix.target, 'musl')
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,zig
+          tool: cargo-zigbuild
 
       - name: Build (musl via cargo-zigbuild)
         if: runner.os == 'Linux' && contains(matrix.target, 'musl')
