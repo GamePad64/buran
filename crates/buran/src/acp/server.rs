@@ -38,10 +38,11 @@ struct SessionHandle {
     skills: Vec<crate::skills::SkillDescription>,
     session: SessionState,
     cancel_tx: watch::Sender<bool>,
-    /// Append handle for this session's transcript; `None` when the store
-    /// refused the file at `newSession` time (persistence degrades, the
-    /// session still runs fully in memory — sessions store spec).
-    store_file: Option<crate::store::SessionFile>,
+    /// Handle to this session's store-writer task (owns the transcript
+    /// file; hardening v1.5.1 Task 13). `None` when the store refused the
+    /// file at `newSession` time (persistence degrades, the session still
+    /// runs fully in memory — sessions store spec).
+    store_file: Option<crate::store::WriterHandle>,
     /// In-flight prompt guard: `mem::take(&mut handle.session)` hands the
     /// history to a running turn; a second concurrent prompt would find it
     /// empty and fork the conversation. MVP is one turn per session — the
@@ -197,7 +198,7 @@ fn build_agent(
                 // Persistence degrades to pre-v1.5 behavior on failure: the
                 // session runs in memory, the failure is logged (Review
                 // Focus #1) — never fatal for the session itself.
-                let store_file =
+                let created_file =
                     match state_new_session
                         .store
                         .create(crate::session::TranscriptMeta {
@@ -221,10 +222,16 @@ fn build_agent(
                 // store's uuidv7), so `loadSession` finds the transcript
                 // under the id the client already knows. Degraded sessions
                 // (no transcript) get a bare uuidv7.
-                let session_id = match &store_file {
+                // The ACP session id IS the transcript filename stem (the
+                // store's uuidv7), so `loadSession` finds the transcript
+                // under the id the client already knows. Degraded sessions
+                // (no transcript) get a bare uuidv7. The id is captured
+                // before `spawn_writer` consumes the file.
+                let session_id = match &created_file {
                     Some(f) => SessionId::new(f.id().to_string()),
                     None => SessionId::new(new_session_id()),
                 };
+                let store_file = created_file.map(|f| f.spawn_writer());
                 state_new_session
                     .sessions
                     .lock()
@@ -303,7 +310,9 @@ fn build_agent(
                         },
                         cancel_tx: watch::channel(false).0,
                         turn_in_flight: false,
-                        store_file: Some(file),
+                        // The writer task owns the reopened file from here
+                        // on (hardening v1.5.1 Task 13).
+                        store_file: Some(file.spawn_writer()),
                         permission_override: None,
                     })
                 })();
@@ -502,10 +511,14 @@ async fn run_prompt_turn(
             // result must not change. The turn may have exited early (LLM
             // error): keep whatever history the turn recorded instead of
             // dropping it.
-            if let Some(file) = handle.store_file.as_mut() {
+            // Fire-and-forget through the writer task (hardening v1.5.1
+            // Task 13): the pump never blocks on disk. Send failure means
+            // the writer died — log and continue (Review Focus #1
+            // degradation), the conversation lives in memory.
+            if let Some(writer) = &handle.store_file {
                 for msg in handle.session.history[starting_history_len..].iter() {
                     if let Err(e) =
-                        file.append(&crate::session::TranscriptRecord::Message(msg.clone()))
+                        writer.append(&crate::session::TranscriptRecord::Message(msg.clone()))
                     {
                         tracing::error!(
                             %e,
@@ -517,9 +530,8 @@ async fn run_prompt_turn(
             // Usage record (hardening v1.5.1): one line per completed turn,
             // after the turn's messages so the transcript reads in order.
             // Degrades like the message appends above.
-            if let (Some(file), Ok((_, Some(usage)))) =
-                (handle.store_file.as_mut(), result.as_ref())
-                && let Err(e) = file.append(&crate::session::TranscriptRecord::Usage {
+            if let (Some(writer), Ok((_, Some(usage)))) = (&handle.store_file, result.as_ref())
+                && let Err(e) = writer.append(&crate::session::TranscriptRecord::Usage {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,

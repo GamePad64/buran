@@ -1583,3 +1583,94 @@ async fn load_session_advertises_modes() {
         .expect("timed out")
         .expect("conn failed");
 }
+
+/// Server-path byte identity (hardening v1.5.1 Task 13): a transcript
+/// written by the server (writer task) replays to the same records a
+/// direct-append transcript of the same turn would produce — same
+/// messages in order, then the usage line.
+#[tokio::test(flavor = "current_thread")]
+async fn server_path_transcript_matches_direct_append_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    let body = format!(
+        "data: {}\n\n{}",
+        text_chunk("Hello"),
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
+    );
+    m.push_response_frames(sse(vec![Box::leak(
+        format!("{body}\n\ndata: [DONE]\n\n").into_boxed_str(),
+    )]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let dir_path = dir.path().to_path_buf();
+    let client = Client.v1().connect_with(agent, async move |cx| {
+        initialize(&cx).await?;
+        let SessionSetup {
+            mut session,
+            response,
+            ..
+        } = cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        let _ = session.read_to_string().await?;
+
+        // Fire-and-forget appends: poll until the writer has flushed the
+        // turn's records (bounded wait, not a sleep guess).
+        let id = response.session_id.0.to_string();
+        let store = buran::store::Store::new(&dir_path);
+        let mut records = Vec::new();
+        for _ in 0..50 {
+            let (_, replayed) = store.open(&id).expect("transcript exists");
+            let has_usage = replayed
+                .iter()
+                .any(|r| matches!(r, TranscriptRecord::Usage { .. }));
+            if has_usage {
+                records = replayed;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !records.is_empty(),
+            "usage record never flushed by the writer task"
+        );
+
+        // The direct-append shape for this turn: metadata head, user
+        // message, assistant message, usage. Replay order must match.
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|r| match r {
+                TranscriptRecord::Metadata(_) => "metadata",
+                TranscriptRecord::Message(m) => match m.role {
+                    buran::llm::types::Role::User => "user",
+                    buran::llm::types::Role::Assistant => "assistant",
+                    _ => "other",
+                },
+                TranscriptRecord::Usage { .. } => "usage",
+                TranscriptRecord::CompactionPoint { .. } => "compaction",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["metadata", "user", "assistant", "usage"],
+            "server-path transcript must read in direct-append order: {kinds:?}"
+        );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
