@@ -5,6 +5,13 @@ on:
   push:
     tags: ['v*']
 
+# softprops/action-gh-release creates the release object; without an
+# explicit grant the default GITHUB_TOKEN is read-only (v1.5.1's first
+# run failed with 403 "Resource not accessible by integration" on all
+# legs whose builds succeeded).
+permissions:
+  contents: write
+
 jobs:
   release:
     strategy:
@@ -40,40 +47,39 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Cross-compiled Linux targets need linkers; musl also needs a
-      # static-libc-capable toolchain. gnu cross targets use the GNU
-      # cross toolchain, musl the musl cross toolchain.
-      - name: Install cross toolchains (Linux non-native targets)
-        if: runner.os == 'Linux' && !contains(matrix.target, 'x86_64')
+      # gnu cross targets need the GNU cross toolchain. musl targets all
+      # build via cargo-zigbuild + zig (first release run: cc-rs's ring
+      # build could not find x86_64/aarch64-linux-musl-gcc, and
+      # musl-tools has no riscv64 sysroot — zig supplies libc for all
+      # three, so no apt musl packages at all).
+      - name: Install cross toolchains (Linux non-native gnu targets)
+        if: runner.os == 'Linux' && contains(matrix.target, 'gnu') && !contains(matrix.target, 'x86_64')
         run: |
           sudo apt-get update
-          if [[ "${{ matrix.target }}" == *musl ]]; then
-            sudo apt-get install -y musl-tools
-          else
-            sudo apt-get install -y gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
-          fi
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
 
-      # zigbuild handles riscv64gc-musl cleanly (musl-tools has no
-      # riscv64 sysroot); native and gnu targets build with cargo
-      # directly. macos/windows arm64 run natively enough for the
-      # default linker.
-      - name: Build (riscv64gc musl via cargo-zigbuild)
-        if: contains(matrix.target, 'riscv64gc') && contains(matrix.target, 'musl')
+      # zig (the compiler, not just the cargo wrapper) is required by
+      # cargo zigbuild; taiki-e/install-action installs cargo-zigbuild
+      # only, and the first release run died with "Failed to find zig".
+      - name: Install zig + cargo-zigbuild (all Linux musl targets)
+        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild,zig
+
+      - name: Build (musl via cargo-zigbuild)
+        if: runner.os == 'Linux' && contains(matrix.target, 'musl')
+        shell: bash
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p buran -p buran-tui
+
       - name: Build
+        if: runner.os != 'Linux' || !contains(matrix.target, 'musl')
         shell: bash
         env:
           # gnu cross targets: point rust at the GNU cross linker.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
-        run: |
-          if [[ "${{ matrix.target }}" == *riscv64gc*unknown-linux-musl ]]; then
-            cargo zigbuild --release --target ${{ matrix.target }} -p buran -p buran-tui
-          else
-            cargo build --release --target ${{ matrix.target }} -p buran -p buran-tui
-          fi
+        run: cargo build --release --target ${{ matrix.target }} -p buran -p buran-tui
 
       - name: Package
         shell: bash
@@ -86,7 +92,9 @@ jobs:
           done
           if [[ "${{ matrix.archive }}" == zip ]]; then
             out="buran-${{ matrix.target }}.zip"
-            zip -r "$out" "$dir"
+            # Windows runners ship 7z but not zip (first release run:
+            # "zip: command not found", exit 127).
+            7z a "$out" "$dir"
           else
             out="buran-${{ matrix.target }}.tar.gz"
             tar czf "$out" "$dir"
