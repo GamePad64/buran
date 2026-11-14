@@ -15,6 +15,7 @@ The lgtm'd scope (prioritization 1→2→4→6→7 plus release CI):
 4. Per-turn token usage recorded into the session transcript (plus a tracing line).
 6. `session/set_mode` handler with three policy-derived modes (`allow_all`, `deny_all`, `ask`).
 7. MCP server restart-on-next-call (lazy, inside `McpManager`).
+7b. Store writer task: transcript appends move behind a per-session in-process writer task with an optional ack protocol (approved 2026-11-14 in chat; the seam pre-effect durability will use).
 + Release CI that produces binaries for the specified matrix on tag push.
 
 Success criteria:
@@ -49,6 +50,7 @@ All six items fail that test:
 - `set_mode` is a stable ACP method the client is allowed to call; answering it is protocol compliance inside the agent.
 - MCP restart requires ownership of the child process map (`McpManager`); a wrapper MCP cannot respawn the servers the manager already spawned.
 - Release CI is repo plumbing, not runtime code.
+- The store writer is an in-process tokio task (Section 7), not a separate service: a process boundary would add IPC without adding durability.
 
 TUI impact: zero in v1.5.1. All changes are in `crates/buran` or `.github/workflows`.
 
@@ -183,6 +185,27 @@ Workflow: `.github/workflows/release.yml`
 - The existing `ci.yml` remains the PR gate (fmt, clippy -D warnings, test, `cargo build --release` on ubuntu).
 
 The string "rva23" is recorded exactly as provided; the actual Rust target triple mapping (e.g. `riscv64gc-unknown-linux-gnu`) will be resolved in the implementation plan / workflow authoring step.
+
+## Section 7: Store writer task
+
+**Decision:** Persistence moves behind an in-process writer task (tokio actor) per session, fed by a channel. NOT a separate process.
+
+Rationale (from the approved chat design):
+- A process boundary adds IPC protocol, lifecycle, and zombie management without adding durability: records sitting in the channel at crash time are lost either way. Pi Durable is likewise a library, not a daemon. AGENTS.md's "one binary, zero runtime dependencies" rules a sidecar process out.
+- The channel gives clean ownership (one writer per file, no `&mut File` in `SessionHandle`, no locks around appends) and a seam for later pre-effect durability; it does not by itself make writes more crash-tolerant than today's synchronous append.
+- Semantics are set by the ack protocol, not the task boundary: fire-and-forget commands are "eventual persistence" (used for the existing post-turn write-through and usage records); acked commands (`append_acked`) let a future caller wait for "on disk" before a side effect (the pre-tool-call checkpoint point — not implemented in this pass, the seam stays).
+
+Implementation:
+- `crates/buran/src/store/writer.rs`: `WriterHandle { tx: mpsc::Sender<StoreCmd> }` with `append(&record)` (fire-and-forget) and `append_acked(&record) -> Result<(), StoreError>`; `StoreCmd::Append { record, ack: Option<oneshot::Sender<Result<(), StoreError>>> }`; `Close`/drop drains and closes the file. Constructor `Store::writer(...)` or `SessionFile::spawn_writer()`.
+- Writer task owns the `SessionFile`; blocking `std::fs` `write_all` inside the dedicated task is fine (the task does nothing else), `tokio::fs` not required.
+- `acp/server.rs`: `SessionHandle.store_file: Option<WriterHandle>`; the turn guard and the usage pump send commands instead of calling `append` directly; degradation is unchanged — a dead/closed writer logs and the session continues in memory.
+- Ordering: per-session channel = FIFO = one record per line in history order, byte-identical transcripts to today.
+
+Testing:
+- Ordering: 10 commands → 10 lines in order.
+- Ack: success resolves; serialize/write failure returns the error; dropped receiver → `append_acked` errors (degradation path).
+- Byte-identity: an integration transcript produced via the writer equals today's direct-append output.
+- Resume/replay unchanged (store reader untouched).
 
 ## Testing strategy (overall)
 
