@@ -3,6 +3,9 @@
 //! index is a derived cache (ADR 0007 policy).
 
 mod replay;
+mod writer;
+
+pub use writer::{StoreCmd, WriterHandle};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, Write};
