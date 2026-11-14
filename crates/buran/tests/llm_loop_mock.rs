@@ -421,3 +421,70 @@ async fn streak_guard_threshold_is_configurable() {
         "guard(2) allows exactly two identical rounds"
     );
 }
+
+/// Review Focus #2 (hardening v1.5.1): a tool call with the same
+/// qualified name but *different* arguments must NOT extend the streak —
+/// alternating `fs__read {"path":"x"}` / `fs__read {"path":"y"}` rounds
+/// are legitimate work, the guard must not cut until `threshold`
+/// *identical* rounds repeat, which never happens here.
+#[tokio::test]
+async fn streak_guard_ignores_tool_calls_with_differing_args() {
+    let m = hclient::mock::MockTransport::new();
+    // Alternate args every round: {"path":"x"}, {"path":"y"}, ...
+    for path in ["x", "y", "x", "y", "x", "y"] {
+        let chunks = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"fs__read","arguments":"{\"pa"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"REPLACED_ME\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        )
+        .replace("REPLACED_ME", path)
+        .leak() as &'static str;
+        m.push_response_frames(sse(vec![chunks]));
+    }
+    // Rounds 7-11: identical {"path":"x"} repeats — the 4 identical
+    // rounds run, the 5th (round 11) is cut.
+    for _ in 0..5 {
+        m.push_response_frames(sse(vec![tool_call_chunks()]));
+    }
+
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let tools = Arc::new(StubCaller::default());
+    let entry = buran::mcp::ToolEntry {
+        server: "fs".into(),
+        tool: buran::mcp::McpTool::new("read", "read file", serde_json::Map::new()),
+    };
+    let loop_ = AgentLoop::new(llm, tools.clone(), "be helpful".to_string())
+        .with_catalog(&buran::mcp::ToolCatalog::new(vec![entry]))
+        .with_same_tool_streak_guard(4);
+    let mut session = SessionState::default();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let answer = tokio::spawn(async move {
+        while let Some(ev) = events_rx.recv().await {
+            if let TurnEvent::PermissionQuery(_) = &ev {
+                let _ = perm_tx.send(PermissionDecision::Allow).await;
+            }
+        }
+    });
+    let summary = loop_
+        .run_turn(&mut session, "read files", events_tx, perm_rx, cancel_rx)
+        .await
+        .unwrap();
+    answer.abort();
+
+    // The 6 alternating rounds are distinct signatures (x/y alternate:
+    // the streak resets to 1 every round), so all six execute. The
+    // identical {"path":"x"} rounds 7-10 build the streak to 4 and all
+    // execute; round 11 (the 5th identical) is cut: 10 calls total.
+    assert_eq!(summary.finish, FinishReason::LoopGuard);
+    assert_eq!(
+        tools.real_calls.load(Ordering::SeqCst),
+        10,
+        "alternating-arg rounds must all execute; only the 5th identical round is cut"
+    );
+}
