@@ -39,7 +39,7 @@ agent-side only.
 
 | Metric | buran 0.1.0 (fat LTO + strip, HTTP listener) | pi 1.5.2 | Claude Code 2.1.310 | opencode |
 |---|---|---|---|---|
-| Binary / install size | **10.3 MB** buran + **3.9 MB** buran-tui (two stripped ELFs; +1.3 MB = axum stack for `--listen`, ADR 0010) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
+| Binary / install size | **9.8 MB** buran + **3.9 MB** buran-tui (two stripped ELFs; axum stack for `--listen` inside the buran number, ADR 0010) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
 | Idle process RSS | **~6.2 MB** (serve, waiting) | — | — | not measured |
 | One process, one active session (prompt-turn peak) | **9.5–9.6 MB** (was 8.8–9.0 pre-axum; budget 10 MB — headroom ~0.4 MB, watched) | ~104–148 MB (node runtime floor ~45 MB) | ~100–400 MB per process | not measured |
 | Interactive fleet (this machine, just now) | n/a (one process per session by design; N HTTP sessions share one process) | 148 MB (one TUI, 90 min) | **1 754 MB** total: 11 `bg-spare` processes 77–405 MB each + daemon 99 MB + `agents` 147 MB | not measured |
@@ -76,10 +76,11 @@ regress past the resource budgets (ADR 0008), that's a release blocker —
 the whole point of the table is that the differentiator stays true.
 
 Budget line, from ADR 0008: session RSS ≤ 10 MB, cold start ≤ 100 ms,
-stripped binary ≤ 15 MB. Current: 9.5–9.6 MB / 4 ms / 10.3 MB — green,
-but RSS headroom is now ~0.4 MB (fat LTO took the peak 6.8 → 8.8 MB;
-the axum stack for `--listen` added ~0.7 more). The next feature with resident cost amends ADR 0008
-first.
+stripped binary ≤ 15 MB. Current: 9.5–9.6 MB RSS / 4 ms / **9.8 MB binary**
+(compaction re-fit LTO sections; binary went 10.3 → 9.8 while gaining the
+feature) — green. RSS headroom is still ~0.4 MB (fat LTO took the peak
+6.8 → 8.8 MB; the axum stack for `--listen` added ~0.7 more). The next
+feature with resident cost amends ADR 0008 first.
 
 ## Reproducing
 
