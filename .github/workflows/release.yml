@@ -62,10 +62,13 @@ jobs:
       # cargo zigbuild; taiki-e/install-action installs cargo-zigbuild
       # only, and the first release run died with "Failed to find zig".
       # install-action also cannot install zig itself ("does not support
-      # zig"; second run), so the compiler comes from setup-zig.
+      # zig"; second run), so the compiler comes from setup-zig. v2 is
+      # required: v1 resolves `latest` (0.17.1) but fetches the OLD
+      # tarball naming (zig-linux-x86_64-<v>) → 404 everywhere; v2 fixed
+      # the naming (third run).
       - name: Install zig (all Linux musl targets)
         if: runner.os == 'Linux' && contains(matrix.target, 'musl')
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
       - name: Install cargo-zigbuild (all Linux musl targets)
         if: runner.os == 'Linux' && contains(matrix.target, 'musl')
         uses: taiki-e/install-action@v2
