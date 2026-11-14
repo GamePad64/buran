@@ -1,0 +1,99 @@
+name: Release
+
+# Tag-triggered release builds; ci.yml stays the PR/push gate.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, archive: zip }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, archive: zip }
+          # Linux. "rva23" from the spec maps to the riscv64gc triple:
+          # rva23 is a RISC-V application-processor profile (RV64GC +
+          # v1.0 vector extensions), which is exactly what the
+          # riscv64gc-unknown-linux-* targets model.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, archive: tar }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, archive: tar }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, archive: tar }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, archive: tar }
+          # rva23 → riscv64gc (see comment above).
+          - { os: ubuntu-latest, target: riscv64gc-unknown-linux-musl, archive: tar }
+          - { os: ubuntu-latest, target: riscv64gc-unknown-linux-gnu, archive: tar }
+          # macOS (Apple silicon only, per spec)
+          - { os: macos-latest, target: aarch64-apple-darwin, archive: tar }
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Cross-compiled Linux targets need linkers; musl also needs a
+      # static-libc-capable toolchain. gnu cross targets use the GNU
+      # cross toolchain, musl the musl cross toolchain.
+      - name: Install cross toolchains (Linux non-native targets)
+        if: runner.os == 'Linux' && !contains(matrix.target, 'x86_64')
+        run: |
+          sudo apt-get update
+          if [[ "${{ matrix.target }}" == *musl ]]; then
+            sudo apt-get install -y musl-tools
+          else
+            sudo apt-get install -y gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
+          fi
+
+      # zigbuild handles riscv64gc-musl cleanly (musl-tools has no
+      # riscv64 sysroot); native and gnu targets build with cargo
+      # directly. macos/windows arm64 run natively enough for the
+      # default linker.
+      - name: Build (riscv64gc musl via cargo-zigbuild)
+        if: contains(matrix.target, 'riscv64gc') && contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        shell: bash
+        env:
+          # gnu cross targets: point rust at the GNU cross linker.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+        run: |
+          if [[ "${{ matrix.target }}" == *riscv64gc*unknown-linux-musl ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }} -p buran -p buran-tui
+          else
+            cargo build --release --target ${{ matrix.target }} -p buran -p buran-tui
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          dir="buran-${{ matrix.target }}"
+          mkdir -p "$dir"
+          for bin in buran buran-tui; do
+            cp "target/${{ matrix.target }}/release/$bin" "$dir/" 2>/dev/null \
+              || cp "target/${{ matrix.target }}/release/$bin.exe" "$dir/"
+          done
+          if [[ "${{ matrix.archive }}" == zip ]]; then
+            out="buran-${{ matrix.target }}.zip"
+            zip -r "$out" "$dir"
+          else
+            out="buran-${{ matrix.target }}.tar.gz"
+            tar czf "$out" "$dir"
+          fi
+          echo "ARCHIVE=$out" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
