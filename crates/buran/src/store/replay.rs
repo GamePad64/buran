@@ -57,6 +57,49 @@ pub(super) fn head_meta(path: &Path) -> Result<TranscriptMeta, StoreError> {
     }
 }
 
+/// First user message in the transcript, normalized through
+/// [`super::session_title`]. Reads a bounded prefix only — the title is
+/// a catalog field, not a reason to replay a long session.
+///
+/// Body damage ends the scan: a torn or corrupt line yields whatever
+/// title was found before it, never an error. Listing must not fail
+/// because a transcript's body is damaged (ADR 0007; the head line is
+/// the only line `list` treats as fatal, and that check stays in
+/// [`head_meta`]).
+pub(super) fn first_user_title(path: &Path, max_chars: usize) -> Option<String> {
+    // Cap the scan: a title that hasn't appeared in the first few
+    // hundred lines is not worth reading the rest of a long transcript
+    // just to label a catalog row.
+    const MAX_LINES: usize = 200;
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    for _ in 0..MAX_LINES {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).ok()?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<TranscriptRecord>(trimmed) else {
+            // Corrupt or torn: stop. A title found earlier still stands.
+            break;
+        };
+        if let TranscriptRecord::Message(message) = record
+            && message.role == crate::llm::types::Role::User
+            && let Some(content) = message
+                .content
+                .as_deref()
+                .filter(|c| c.split_whitespace().next().is_some())
+        {
+            return Some(super::session_title(content, max_chars));
+        }
+    }
+    None
+}
+
 /// Single pass: each line is judged as it is read, and a parse failure is
 /// torn-tail-tolerated only when nothing follows the failed line — checked
 /// by one more `read_line` (0 bytes back == clean EOF right after). This

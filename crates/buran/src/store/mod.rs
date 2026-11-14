@@ -26,6 +26,26 @@ pub enum StoreError {
 pub struct SessionInfo {
     pub id: String,
     pub meta: TranscriptMeta,
+    /// First user message, whitespace-collapsed and ellipsis-capped by
+    /// [`session_title`]; `None` while the session has no user message.
+    /// `list` scans a bounded head prefix — the title must not cost a
+    /// full replay of every transcript in the catalog.
+    pub title: Option<String>,
+}
+
+/// Longest title `list` carries; the ellipsis is part of the count.
+pub const TITLE_MAX_CHARS: usize = 80;
+
+/// Human-readable session title from the first user message: one line,
+/// internal whitespace collapsed, ellipsis-capped at `max` chars
+/// (chars, not bytes — a cut inside a multibyte char must not split it).
+pub fn session_title(raw: &str, max: usize) -> String {
+    let one_line: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let cut: String = one_line.chars().take(max - 1).collect();
+    format!("{cut}…")
 }
 
 /// Current UTC time as an RFC 3339 string. Hand-rolled civil-from-days
@@ -131,9 +151,15 @@ impl Store {
                 continue;
             };
             let head = replay::head_meta(&entry.path())?;
+            // Bounded scan, not a full replay: the catalog must stay cheap
+            // even when transcripts grow. Body damage ends the scan and
+            // yields whatever title was found before it (ADR 0007: listing
+            // never fails over body damage).
+            let title = replay::first_user_title(&entry.path(), TITLE_MAX_CHARS);
             out.push(SessionInfo {
                 id: stem.to_string(),
                 meta: head,
+                title,
             });
         }
         // UUIDv7: lexicographic == chronological.
