@@ -23,6 +23,7 @@ use agent_client_protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::compact::summarizer::Summarizer as _;
 use crate::config::{Config, PermissionPolicy, ProviderConfig};
 use crate::llm::loop_::{AgentLoop, PermissionDecision, SessionState, TurnEvent};
 use crate::llm::types::FinishReason;
@@ -284,13 +285,17 @@ fn build_agent(
                     }
                     let mut history = Vec::new();
                     let mut compaction_points = Vec::new();
+                    let mut compaction_summaries = Vec::new();
                     for record in &records {
                         match record {
                             crate::session::TranscriptRecord::Message(m) => history.push(m.clone()),
                             crate::session::TranscriptRecord::CompactionPoint {
                                 at_message,
-                                ..
-                            } => compaction_points.push(*at_message),
+                                summary,
+                            } => {
+                                compaction_points.push(*at_message);
+                                compaction_summaries.push(summary.clone());
+                            }
                             crate::session::TranscriptRecord::Metadata(_) => {}
                             // Usage is bookkeeping, not conversation: it
                             // must not affect the rebuilt SessionState
@@ -307,6 +312,7 @@ fn build_agent(
                         session: SessionState {
                             history,
                             compaction_points,
+                            compaction_summaries,
                         },
                         cancel_tx: watch::channel(false).0,
                         turn_in_flight: false,
@@ -485,6 +491,112 @@ fn build_agent(
 /// `session/update` notifications, maps the finish reason to a StopReason.
 /// Cancellation maps to `Cancelled` (the protocol-required answer after
 /// `session/cancel`).
+/// `/compact [instructions]` (ADR 0006): cut the span, summarize it, and
+/// record a CompactionPoint — all-or-nothing. A Summarizer failure sends
+/// a message chunk and leaves the conversation untouched; the turn is a
+/// clean EndTurn either way (the command itself did or did not run —
+/// there is no half-compacted state to report).
+async fn run_compact_command(
+    state: &ServerState,
+    provider: &ProviderConfig,
+    session_id: &SessionId,
+    conn: &ConnectionTo<AcpClient>,
+    instructions: &str,
+) -> Result<StopReason, PromptError> {
+    let llm =
+        (state.llm_factory)(provider).map_err(|e| PromptError::Rejected(anyhow::anyhow!("{e}")))?;
+    let summarizer = crate::compact::summarizer::BuiltinSummarizer::new(llm);
+
+    // Take the session out for the duration; cut_span reads history only.
+    let (mut session, writer) = {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        let handle = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| PromptError::Rejected(anyhow::anyhow!("unknown session")))?;
+        if handle.turn_in_flight {
+            return Err(PromptError::Rejected(anyhow::anyhow!(
+                "session already has a prompt in flight"
+            )));
+        }
+        handle.turn_in_flight = true;
+        (
+            std::mem::take(&mut handle.session),
+            handle.store_file.clone(),
+        )
+    };
+    let result = async {
+        // Manual /compact always compacts the oldest half (ADR 0006:
+        // keep_recent defaults chosen so a bare /compact roughly halves
+        // the window; budget knobs arrive with config plumbing).
+        let total_tokens: usize = session
+            .history
+            .iter()
+            .map(|m| m.content.as_deref().unwrap_or("").len())
+            .sum::<usize>()
+            .div_ceil(4);
+        let Some(cut) = crate::compact::cut_span(&session.history, total_tokens / 2) else {
+            anyhow::bail!("nothing to compact: history is within budget");
+        };
+        let span: Vec<crate::llm::types::ChatMessage> = session.history[..cut].to_vec();
+        let summary = summarizer
+            .summarize(&span, Some(instructions).filter(|s| !s.is_empty()), 512)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Both records BEFORE the state mutates: the store is the canon
+        // (ADR 0007); a failed write aborts the compaction.
+        if let Some(writer) = &writer {
+            writer
+                .append_acked(&crate::session::TranscriptRecord::CompactionPoint {
+                    at_message: cut,
+                    summary: Some(summary.clone()),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("store append failed: {e}"))?;
+        }
+        session.set_compaction(cut, Some(summary.clone()));
+        Ok::<String, anyhow::Error>(summary)
+    }
+    .await;
+
+    // Hand the state back and clear the guard, on every path.
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        if let Some(handle) = sessions.get_mut(session_id) {
+            handle.session = session;
+            handle.turn_in_flight = false;
+        }
+    }
+
+    match result {
+        Ok(summary) => {
+            let _ = conn.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(format!(
+                        "[compacted {} messages: {}]",
+                        // Message count is cosmetic; the summary is the payload.
+                        summary.len(),
+                        summary
+                    )),
+                ))),
+            ));
+            Ok(StopReason::EndTurn)
+        }
+        Err(error) => {
+            // All-or-nothing (ADR 0006): no CompactionPoint written, no
+            // summary stored — the conversation continues on the old
+            // window. The failure is user-visible text, not a crash.
+            let _ = conn.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(format!("[compact failed: {error}]")),
+                ))),
+            ));
+            Ok(StopReason::EndTurn)
+        }
+    }
+}
+
 async fn run_prompt_turn(
     state: &ServerState,
     provider: &ProviderConfig,
@@ -501,6 +613,15 @@ async fn run_prompt_turn(
             }
             text.push_str(&t.text);
         }
+    }
+
+    // `/compact [instructions]` (ADR 0006): runs BEFORE any LLM round.
+    // All-or-nothing — a Summarizer failure surfaces as a message chunk,
+    // the conversation continues on the old window. The compaction is
+    // harness-initiated and deliberately bypasses the permission gate.
+    if let Some(args) = text.strip_prefix("/compact") {
+        return run_compact_command(state, provider, &req.session_id, conn, args.trim_start())
+            .await;
     }
 
     // History length BEFORE `mem::take`, under the same lock: everything

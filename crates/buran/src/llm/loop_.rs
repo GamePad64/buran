@@ -90,6 +90,62 @@ pub struct SessionState {
     pub history: Vec<ChatMessage>,
     /// Message indices that start a compaction window (v1.5 storage hook).
     pub compaction_points: Vec<usize>,
+    /// Stored summaries, one per compaction point (same order as
+    /// `compaction_points`). `None` entries mean "point recorded, summary
+    /// pending" — the projection ignores a pending point until its
+    /// summary lands (all-or-nothing, ADR 0006).
+    pub compaction_summaries: Vec<Option<String>>,
+}
+
+impl SessionState {
+    /// Records a compaction boundary: everything before `at` projects as
+    /// `summary`. Append-only, like the history itself.
+    pub fn set_compaction(&mut self, at: usize, summary: Option<String>) {
+        self.compaction_points.push(at);
+        self.compaction_summaries.push(summary);
+    }
+
+    /// The messages the next LLM request carries: the newest SUMMARY (as
+    /// a system note) + every message from its kept boundary onward.
+    /// One definition — the loop, loadSession replay, and tests read the
+    /// same window. Points without summaries (a failed compaction) and
+    /// boundaries past the tail (torn-write edge) clamp safely to the
+    /// full history.
+    pub fn window(&self) -> Vec<ChatMessage> {
+        // Newest point WITH a summary; pending points are invisible to
+        // the projection (their compaction did not complete).
+        let boundary = self
+            .compaction_points
+            .iter()
+            .zip(&self.compaction_summaries)
+            .filter_map(|(at, summary)| summary.as_ref().map(|s| (*at, s)))
+            .max_by_key(|(at, _)| *at)
+            .map(|(at, _)| at.min(self.history.len()))
+            // A boundary AT the tail cannot stand in for a tail that does
+            // not exist — and a past-tail point describes messages that
+            // never were (torn write). Such a point is ignored: the full
+            // history projects.
+            .filter(|at| *at < self.history.len())
+            .unwrap_or(0);
+        let mut window = Vec::new();
+        if boundary > 0 {
+            // The newest summary text — a compaction that chains over an
+            // older one replaces it entirely (ADR 0006: chained spans).
+            if let Some((_, summary)) = self
+                .compaction_points
+                .iter()
+                .zip(&self.compaction_summaries)
+                .rfind(|(at, s)| **at == boundary && s.is_some())
+            {
+                window.push(ChatMessage::system(format!(
+                    "Summary of the earlier conversation:\n{}",
+                    summary.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+        window.extend(self.history[boundary..].iter().cloned());
+        window
+    }
 }
 
 /// What a finished turn produced.
@@ -230,7 +286,10 @@ impl AgentLoop {
             }
 
             let mut messages = vec![ChatMessage::system(self.system.clone())];
-            messages.extend(session.history.iter().cloned());
+            // The projection (ADR 0006): after a compaction the request
+            // carries summary + kept tail, not the full history. One
+            // definition on SessionState — replay and tests read it too.
+            messages.extend(session.window());
             let req = ChatRequest::new(self.llm.model_name().to_string(), messages);
             let req = if self.tool_defs.is_empty() {
                 req
