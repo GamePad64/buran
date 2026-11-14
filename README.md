@@ -95,7 +95,9 @@ buran-tui --fork <id>          # branch; the original is never touched
 buran sessions rm <id>         # delete
 ```
 
-Resume semantics: `serve` validates the id before the ACP channel opens; a client then attaches to the stored conversation via `session/loadSession` (cwd must match the session's recorded cwd). A torn final line (crash mid-append) replays up to the last good line; unknown record types are skipped for forward compatibility.
+Switching sessions live: **Ctrl-R** in buran-tui opens the session picker — sessions created in the current directory, newest first, titled by their first user message. `Enter` attaches via `loadSession`; the conversation replays into the view. Sessions from other directories are counted, not listed (they cannot be loaded here). A session's title is its first user message, whitespace-collapsed, capped at 80 characters.
+
+Resume semantics: `serve` validates the id before the ACP channel opens; a client then attaches to the stored conversation via `session/loadSession` (cwd must match the session's recorded cwd), and the agent replays the stored conversation to the client as `session/update` notifications before the load response. A torn final line (crash mid-append) replays up to the last good line; unknown record types are skipped for forward compatibility.
 
 ## ACP contract
 
