@@ -27,12 +27,40 @@ pub enum Action {
     Submit(String),
     /// Quit the app.
     Quit,
+    /// Open the session picker (Ctrl-R).
+    OpenPicker,
+    /// User picked a session in the picker; the loop switches.
+    SwitchSession(String),
     /// Nothing (consumed by the view: typing, scrolling, modal answers).
     None,
 }
 
+/// The session picker overlay. Opened with Ctrl-R when no turn is in
+/// flight and no permission modal is up; `rows`/`hidden` come from
+/// [`crate::sessions::catalog`].
+#[derive(Default)]
+pub struct Picker {
+    pub rows: Vec<crate::sessions::SessionRow>,
+    pub hidden: usize,
+    pub selected: usize,
+}
+
+impl Picker {
+    /// Moves the selection; clamped, wrap-free (the list is short and a
+    /// runaway cursor at either end is clearer than a surprise wrap).
+    pub fn move_selection(&mut self, delta: i32) {
+        let len = self.rows.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.selected as i32;
+        self.selected = current.saturating_add(delta).clamp(0, len as i32 - 1) as usize;
+    }
+}
+
 /// Whole UI state: transcript, input buffer, pending permission question,
-/// scroll offset (`None` = stick to bottom), and turn status.
+/// scroll offset (`None` = stick to bottom), turn status, and the picker
+/// overlay when open.
 #[derive(Default)]
 pub struct App {
     pub entries: Vec<Entry>,
@@ -42,6 +70,7 @@ pub struct App {
     /// Manual scroll offset from the bottom; `None` follows the tail.
     pub scroll: Option<u16>,
     pub streaming: bool,
+    pub picker: Option<Picker>,
 }
 
 impl App {
@@ -92,9 +121,47 @@ impl App {
             return Action::None;
         }
 
+        // The picker captures the keyboard while open: navigation and
+        // confirm/cancel are its keys; everything else is dropped so a
+        // stray character cannot leak into the input buffer of a session
+        // the user is about to leave.
+        if let Some(picker) = self.picker.as_mut() {
+            return match key.code {
+                KeyCode::Up => {
+                    picker.move_selection(-1);
+                    Action::None
+                }
+                KeyCode::Down => {
+                    picker.move_selection(1);
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    let picker = self.picker.take().expect("checked Some above");
+                    match picker.rows.into_iter().nth(picker.selected) {
+                        Some(row) => Action::SwitchSession(row.id),
+                        None => Action::None,
+                    }
+                }
+                KeyCode::Esc => {
+                    self.picker = None;
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
+
         match (key.modifiers, key.code) {
             (m, KeyCode::Char('c')) if m.contains(KeyModifiers::CONTROL) => Action::Quit,
             (m, KeyCode::Char('q')) if m.contains(KeyModifiers::CONTROL) => Action::Quit,
+            // Picker opens only when idle: a switch mid-turn would race the
+            // in-flight prompt (and ACP prompt/stop semantics are not worth
+            // untangling for v1 of the picker). The status line says so.
+            (m, KeyCode::Char('r')) if m.contains(KeyModifiers::CONTROL) => {
+                if self.streaming {
+                    return Action::None;
+                }
+                Action::OpenPicker
+            }
             (_, KeyCode::Enter) => {
                 let line = std::mem::take(&mut self.input);
                 if line == ":quit" {
@@ -147,6 +214,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     render_transcript(frame, app, transcript);
     render_status(frame, app, status);
     render_input(frame, app, input);
+    if let Some(picker) = &app.picker {
+        render_picker(frame, picker, frame.area());
+    }
     if let Some(question) = &app.question {
         render_modal(frame, question, frame.area());
     }
@@ -210,11 +280,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.streaming {
         Span::styled(
-            " streaming… ",
+            " streaming… (Ctrl-R waits for the turn to end) ",
             Style::default().bg(Color::Blue).fg(Color::White),
         )
     } else {
-        Span::styled(" ready ", Style::default().fg(Color::DarkGray))
+        Span::styled(
+            " ready (Ctrl-R: sessions) ",
+            Style::default().fg(Color::DarkGray),
+        )
     };
     frame.render_widget(Line::from(vec![state]), area);
 }
@@ -239,6 +312,72 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("▏", Style::default().fg(Color::Cyan)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
+    // 3/4 width, up to 12 rows + footer + 2 border lines, centered.
+    let width = (area.width * 3 / 4).max(40).min(area.width);
+    let list_height = picker.rows.len().min(12) as u16;
+    let height = (list_height + 3).min(area.height);
+    let box_area = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" sessions — Ctrl-R, Enter opens, Esc closes ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    // The picker draws its own inner lines so the footer (hidden count)
+    // sits below the list inside one bordered box.
+    let mut lines: Vec<Line> = Vec::new();
+    if picker.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no sessions in this directory",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, row) in picker.rows.iter().enumerate() {
+        let marker = if i == picker.selected { " > " } else { "   " };
+        let age = crate::sessions::relative_age(
+            &row.started_at,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        // cwd shortened to its last component: the picker is filtered to
+        // one directory anyway, and the full path eats the title.
+        let dir = row
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| row.cwd.display().to_string());
+        let title = row.title.clone().unwrap_or_else(|| "(empty)".into());
+        let style = if i == picker.selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{age:>4}  {dir}  {title}"),
+            style,
+        )));
+    }
+    if picker.hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} more in other directories (resume there to see them)",
+                picker.hidden
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
 fn render_modal(frame: &mut Frame, question: &PermissionQuestion, area: Rect) {

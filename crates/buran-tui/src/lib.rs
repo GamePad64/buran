@@ -4,4 +4,5 @@
 //! rendering on ratatui's offscreen backend, both without a terminal.
 
 pub mod acp_client;
+pub mod sessions;
 pub mod ui;

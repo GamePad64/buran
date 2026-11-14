@@ -86,7 +86,9 @@ fn sessions_list_and_rm_roundtrip_through_the_real_binary() {
         out.contains("2026-11-12T00:00:00Z"),
         "list carries started_at: {out}"
     );
-    assert!(out.contains("m"), "list must carry head model: {out}");
+    // The model column left the list (title + cwd replaced it); what
+    // remains of the head that this roundtrip must still prove is the
+    // timestamp and the id, asserted above.
 
     run_buran_with_home(home.path(), &["sessions", "rm", id]);
     let out = run_buran_with_home(home.path(), &["sessions", "list"]);

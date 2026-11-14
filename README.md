@@ -89,7 +89,7 @@ On first run, `buran doctor` detects an empty MCP configuration and offers **ACT
 Every conversation persists as an append-only JSONL transcript in `~/.local/state/buran/sessions/`, named by its UUIDv7 id (filename order = chronological order; ADR 0007: the directory listing is the catalog — no index, no SQLite).
 
 ```sh
-buran sessions list            # id, started_at, model, forked_from
+buran sessions list            # newest first: id, started_at, title, cwd, forked_from
 buran-tui --resume latest      # most recent session
 buran-tui --fork <id>          # branch; the original is never touched
 buran sessions rm <id>         # delete

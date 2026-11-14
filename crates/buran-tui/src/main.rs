@@ -9,6 +9,7 @@
 //! work lives in `acp_client`; all drawing in `ui`.
 
 mod acp_client;
+mod sessions;
 mod ui;
 
 use anyhow::Context;
@@ -70,6 +71,10 @@ enum Step {
     Quit,
     /// The user submitted a line; a turn starts.
     Submit(String),
+    /// The user asked for the session picker.
+    OpenPicker,
+    /// The user picked a session; switch with rollback.
+    SwitchSession(String),
     /// Only view state changed; redraw and loop.
     Continue,
 }
@@ -150,11 +155,64 @@ async fn run_app(
                 app.streaming = true;
                 turn = Some(client.prompt_detached(line));
             }
+            Step::OpenPicker => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let catalog = sessions::catalog(&sessions::store_root(), &cwd);
+                app.picker = Some(ui::Picker {
+                    rows: catalog.rows,
+                    hidden: catalog.hidden,
+                    selected: 0,
+                });
+            }
+            Step::SwitchSession(id) => {
+                switch_with_rollback(terminal, &client, &mut app, &mut turn, &id).await;
+            }
         }
     }
 
     client.shutdown();
     Ok(())
+}
+
+/// Switches the view and client to `id`; on failure re-loads the previous
+/// session so the screen never sits empty, and surfaces the error in the
+/// transcript. The previous session id must be known before clearing.
+async fn switch_with_rollback(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    client: &AcpClient,
+    app: &mut ui::App,
+    turn: &mut Option<TurnHandle>,
+    id: &str,
+) {
+    // Blocked earlier (picker opens only when idle), but the guard stays:
+    // switch_with_rollback is the only place allowed to touch sessions,
+    // so its own invariant lives here, not in the key handler.
+    if turn.is_some() {
+        app.append_assistant("\n[session switch blocked: a turn is in flight]");
+        return;
+    }
+    let previous = client.current_session_id();
+    // Clear the view BEFORE the load: replay must rebuild from empty, not
+    // append onto the old conversation.
+    app.entries.clear();
+    app.scroll = None;
+    terminal.clear().ok();
+    match client.switch_session(id.to_string()).await {
+        Ok(_) => {
+            // Replay arrives through next_event in the main loop; nothing
+            // else to do here. The draft input is gone by design.
+            app.input.clear();
+        }
+        Err(error) => {
+            // Roll the view and the client back to the session that works.
+            if let Some(prev) = &previous {
+                let _ = client.switch_session(prev.clone()).await;
+            }
+            app.entries.clear();
+            app.scroll = None;
+            app.append_assistant(&format!("\n[session switch failed: {error}]"));
+        }
+    }
 }
 
 /// Applies one key press to the app state. Submissions pass through as
@@ -164,6 +222,8 @@ fn on_key(app: &mut App, key: KeyEvent) -> Step {
     match app.on_key(key) {
         ui::Action::Submit(line) => Step::Submit(line),
         ui::Action::Quit => Step::Quit,
+        ui::Action::OpenPicker => Step::OpenPicker,
+        ui::Action::SwitchSession(id) => Step::SwitchSession(id),
         ui::Action::None => Step::Continue,
     }
 }

@@ -161,6 +161,139 @@ async fn client_loads_session_and_surfaces_replayed_user_text() {
     client.shutdown();
 }
 
+/// Fake agent with TWO sessions and a loadSession capability: `session/new`
+/// mints "fake-session-1"; `session/load` of "fake-session-2" replays one
+/// user turn ("other session turn") then answers; load of anything else
+/// errors. Both prompt targets answer with a chunk + end_turn tagged by
+/// session, so a test can prove WHICH session a prompt hit.
+fn fake_agent_two_sessions() -> String {
+    r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"fake-session-1"}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      sid=$(printf '%s' "$line" | sed 's/.*"sessionId":"\([^"]*\)".*/\1/')
+      if [ "$sid" = "fake-session-2" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"other session turn"}}}}\n' "$sid"
+        printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32602,"message":"unknown session: %s"}}\n' "$id" "$sid"
+      fi
+      ;;
+    *'"method":"session/prompt"'*)
+      sid=$(printf '%s' "$line" | sed 's/.*"sessionId":"\([^"]*\)".*/\1/')
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply-to-%s"}}}}\n' "$sid" "$sid"
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+    *'session/request_permission'*|*'fs/read_text_file'*)
+      printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32601,"message":"not implemented"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+    .to_string()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn switch_session_replays_and_routes_prompt_to_the_new_session() {
+    let client = AcpClient::spawn(
+        &format!("bash -c {}", shell_quote(&fake_agent_two_sessions())),
+        None,
+        None,
+    )
+    .await
+    .expect("spawn");
+
+    // Switch to the second session: replay surfaces as UserText.
+    let replay = client
+        .switch_session("fake-session-2".into())
+        .await
+        .expect("switch succeeded");
+    assert_eq!(replay, "fake-session-2", "current id updated");
+    assert_eq!(
+        client.current_session_id().as_deref(),
+        Some("fake-session-2"),
+        "rollback anchor tracks the switch"
+    );
+
+    let event = tokio::time::timeout(TIMEOUT, client.next_event())
+        .await
+        .expect("replay event timed out")
+        .expect("connection closed before replay");
+    let ClientEvent::UserText(text) = event else {
+        panic!("expected UserText replay, got {event:?}");
+    };
+    assert_eq!(text, "other session turn");
+
+    // A prompt after the switch must carry the NEW session id.
+    let mut turn = client.prompt_detached("ping".into());
+    let stop = tokio::time::timeout(TIMEOUT, turn.stop_reason())
+        .await
+        .expect("turn timed out")
+        .expect("turn failed");
+    assert_eq!(stop, StopReason::EndTurn);
+    let event = tokio::time::timeout(TIMEOUT, client.next_event())
+        .await
+        .expect("chunk event timed out")
+        .expect("connection closed before chunk");
+    let ClientEvent::Text(text) = event else {
+        panic!("expected text chunk, got {event:?}");
+    };
+    assert!(
+        text.contains("fake-session-2"),
+        "prompt must target the switched session: {text}"
+    );
+
+    client.shutdown();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn switch_session_failure_leaves_the_current_session_untouched() {
+    let client = AcpClient::spawn(
+        &format!("bash -c {}", shell_quote(&fake_agent_two_sessions())),
+        None,
+        None,
+    )
+    .await
+    .expect("spawn");
+
+    let error = client
+        .switch_session("no-such-session".into())
+        .await
+        .expect_err("switch to unknown session must fail");
+    assert!(
+        error.to_string().contains("no-such-session"),
+        "error names the session: {error}"
+    );
+
+    // The old session still works: prompt routes to fake-session-1.
+    let mut turn = client.prompt_detached("ping".into());
+    let stop = tokio::time::timeout(TIMEOUT, turn.stop_reason())
+        .await
+        .expect("turn timed out")
+        .expect("turn failed");
+    assert_eq!(stop, StopReason::EndTurn);
+    let event = tokio::time::timeout(TIMEOUT, client.next_event())
+        .await
+        .expect("chunk event timed out")
+        .expect("connection closed before chunk");
+    let ClientEvent::Text(text) = event else {
+        panic!("expected text chunk, got {event:?}");
+    };
+    assert!(
+        text.contains("fake-session-1"),
+        "failed switch must not change the active session: {text}"
+    );
+
+    client.shutdown();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn resume_latest_with_empty_store_fails_loudly() {
     // Empty HOME store: "latest" cannot resolve. The TUI must fail the

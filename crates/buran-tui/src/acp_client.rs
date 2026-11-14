@@ -212,7 +212,10 @@ impl ReadyReporter {
 /// long as the connection: the SDK reaps it when the connection drops.
 pub struct AcpClient {
     connection: ConnectionTo<Agent>,
-    session_id: SessionId,
+    /// Interior mutability: `switch_session` replaces it after a
+    /// successful load while the UI holds `&self` (the event loop never
+    /// mutably borrows the client).
+    session_id: std::sync::Mutex<SessionId>,
     /// All inbound protocol traffic (chunks and questions), in arrival
     /// order.
     events: tokio::sync::Mutex<mpsc::Receiver<ClientEvent>>,
@@ -449,7 +452,7 @@ impl AcpClient {
 
         Ok(AcpClient {
             connection,
-            session_id,
+            session_id: std::sync::Mutex::new(session_id),
             events: tokio::sync::Mutex::new(event_rx),
         })
     }
@@ -469,7 +472,9 @@ impl AcpClient {
     /// point of detaching.
     pub fn prompt_detached(&self, text: String) -> TurnHandle {
         let connection = self.connection.clone();
-        let session_id = self.session_id.clone();
+        // Snapshot at submit time: a session switch mid-turn cannot retarget
+        // an in-flight prompt (the UI blocks switching while streaming).
+        let session_id = self.session_id.lock().unwrap().clone();
         let (stop_tx, stop_rx) = oneshot::channel();
         tokio::spawn(async move {
             let request =
@@ -483,6 +488,41 @@ impl AcpClient {
             let _ = stop_tx.send(result);
         });
         TurnHandle { stop_rx }
+    }
+
+    /// Attaches to an already-stored session on the live connection and
+    /// makes it the current one. Replay notifications the agent sends
+    /// before the load response arrive through the same event stream as
+    /// live turns (the builder-level handler), so the caller drains
+    /// `next_event` afterwards to rebuild the view.
+    ///
+    /// On failure the current session id is unchanged: a rejected load
+    /// must not strand the UI pointing at a session the agent refused.
+    /// The caller owns rollback of the VIEW (re-load the previous id);
+    /// this method only guards the id.
+    pub async fn switch_session(&self, id: String) -> anyhow::Result<String> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let setup = self
+            .connection
+            .load_session(SessionId::new(id.clone()), cwd)
+            .block_task()
+            .start_session()
+            .await
+            .map_err(|error| anyhow::anyhow!("session/load failed: {error}"))?;
+        // The loaded id IS the session id (same rule as spawn's resume path).
+        let loaded = setup.session.session_id().clone();
+        // `session_id` is only replaced after the load succeeded, so a
+        // failure above leaves prompts routed at the session that works.
+        // Interior mutability: `prompt_detached` borrows `&self`, and the
+        // UI holds the client across the switch.
+        *self.session_id.lock().unwrap() = loaded.clone();
+        Ok(loaded.0.to_string())
+    }
+
+    /// The session id prompts currently route to — the rollback anchor
+    /// for a failed switch (`switch_with_rollback` reloads this id).
+    pub fn current_session_id(&self) -> Option<String> {
+        Some(self.session_id.lock().unwrap().0.to_string())
     }
 
     /// Ends the TUI session: dropping the connection closes the child's
