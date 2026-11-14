@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use super::*;
 
-/// The original configs must survive in the manager so a later
-/// lazy-restart can respawn from them (hardening v1.5.1).
+/// The original configs must survive in the manager so lazy restart-on-call
+/// can respawn from them (hardening v1.5.1) — exercised end-to-end by
+/// `dead_server_is_respawned_and_call_succeeds` in `mcp_mock_server.rs`;
+/// this pins that the configs themselves are stored verbatim, in order.
 #[tokio::test]
-async fn start_stores_original_configs_for_restart() {
+async fn start_stores_original_configs() {
     let configs = vec![
         McpServerConfig {
             name: "a".into(),
@@ -26,9 +28,27 @@ async fn start_stores_original_configs_for_restart() {
     let manager = McpManager::start(&configs, Duration::from_secs(1))
         .await
         .unwrap();
-    let stored = manager.stored_configs();
-    assert_eq!(stored.len(), 2);
-    assert_eq!(stored[0].name, "a");
-    assert_eq!(stored[1].args, vec!["-A".to_string()]);
+    assert_eq!(manager.configs, configs);
     manager.shutdown().await;
+}
+
+/// Dead-transport detection: the classification of rmcp errors marks
+/// transport-level failures as restartable while MCP-level errors are not.
+#[test]
+fn transport_errors_are_restartable_and_mcp_errors_are_not() {
+    use rmcp::model::ErrorData;
+    let mcp = ErrorData::invalid_request("nope", None);
+    assert!(!is_restartable(&rmcp::ServiceError::McpError(mcp)));
+    assert!(is_restartable(&rmcp::ServiceError::TransportClosed));
+    // TransportSend wraps a DynamicTransportError; build one from parts.
+    let dte = rmcp::transport::DynamicTransportError::from_parts(
+        "test",
+        std::any::TypeId::of::<()>(),
+        "pipe".into(),
+    );
+    assert!(is_restartable(&rmcp::ServiceError::TransportSend(dte)));
+    assert!(!is_restartable(&rmcp::ServiceError::UnexpectedResponse));
+    assert!(!is_restartable(&rmcp::ServiceError::Cancelled {
+        reason: None
+    }));
 }

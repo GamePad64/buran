@@ -25,10 +25,15 @@ async fn broken_server_is_recorded_as_failure_and_manager_survives() {
         .await
         .expect("manager must construct even when every server fails");
 
-    assert_eq!(manager.failures().len(), 1, "{:?}", manager.failures());
-    assert_eq!(manager.failures()[0].0, "cat");
+    assert_eq!(
+        manager.failures().await.len(),
+        1,
+        "{:?}",
+        manager.failures().await
+    );
+    assert_eq!(manager.failures().await[0].0, "cat");
     assert!(
-        !manager.failures()[0].1.is_empty(),
+        !manager.failures().await[0].1.is_empty(),
         "failure reason must be non-empty"
     );
     assert!(manager.catalog().await.names().is_empty());
@@ -46,7 +51,8 @@ async fn mixed_healthy_and_broken_servers_degrade() {
         .await
         .expect("manager must construct");
 
-    let failed: Vec<&str> = manager.failures().iter().map(|(n, _)| n.as_str()).collect();
+    let failures_now = manager.failures().await;
+    let failed: Vec<&str> = failures_now.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(failed, ["echo", "cat"], "config order: {:?}", failed);
     manager.shutdown().await;
 }
@@ -60,7 +66,7 @@ async fn missing_binary_is_recorded_not_fatal() {
     .await
     .expect("manager must construct");
 
-    assert_eq!(manager.failures()[0].0, "ghost");
+    assert_eq!(manager.failures().await[0].0, "ghost");
     manager.shutdown().await;
 }
 
@@ -113,9 +119,9 @@ async fn real_filesystem_server_from_mcp_json_is_picked_up() {
         .expect("manager constructs");
 
     assert!(
-        manager.failures().is_empty(),
+        manager.failures().await.is_empty(),
         "real fs server must handshake: {:?}",
-        manager.failures()
+        manager.failures().await
     );
     let names = manager.catalog().await.names();
     assert!(
@@ -159,9 +165,9 @@ async fn tools_list_timeout_degrades_with_warning_failure() {
     .await
     .expect("handshake succeeds: manager constructs");
     assert!(
-        manager.failures().is_empty(),
+        manager.failures().await.is_empty(),
         "handshake passed, no startup failures: {:?}",
-        manager.failures()
+        manager.failures().await
     );
 
     // catalog() must return promptly (bounded by LIST_TIMEOUT + slack),
@@ -179,6 +185,140 @@ async fn tools_list_timeout_degrades_with_warning_failure() {
         catalog.names().is_empty(),
         "silent server contributes no tools: {:?}",
         catalog.names()
+    );
+    manager.shutdown().await;
+}
+
+/// A server that answers the handshake and the first request normally, then
+/// exits. The next call must lazily respawn it from the original config and
+/// the retried call must succeed (hardening v1.5.1: lazy restart-on-call).
+fn die_after_first_call_script() -> String {
+    // Counts requests; the second `tools/call` request exits the process,
+    // so the *next* call finds a dead transport and must respawn.
+    // rmcp numeric ids are echoed verbatim.
+    r#"
+N=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2026-07-28","capabilities":{},"serverInfo":{"name":"die-after-first","version":"0"}}}\n' "$id"
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      N=$((N+1))
+      if [ "$N" -ge 2 ]; then
+        exit 0
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"first"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn dead_server_is_respawned_and_call_succeeds() {
+    let manager = McpManager::start(
+        &[server(
+            "dying",
+            "bash",
+            &["-c", &die_after_first_call_script()],
+        )],
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("handshake succeeds: manager constructs");
+    assert!(
+        manager.failures().await.is_empty(),
+        "{:?}",
+        manager.failures().await
+    );
+
+    // First call answers normally.
+    let first = manager.call("dying/echo", serde_json::json!({})).await;
+    assert!(
+        matches!(&first, Ok(out) if out.text == "first"),
+        "first call must succeed: {first:?}"
+    );
+
+    // The child is gone now (it exited after the second tools/call...
+    // but this is the first, so force the exit by making the transport
+    // close: the script exits on the second call, so run one more call
+    // which will fail with a dead-transport error).
+    let _ = manager.call("dying/echo", serde_json::json!({})).await;
+
+    // Third call must lazily respawn the server and succeed again.
+    let third = manager.call("dying/echo", serde_json::json!({})).await;
+    assert!(
+        matches!(&third, Ok(out) if out.text == "first"),
+        "third call must succeed via lazy restart: {third:?}"
+    );
+    assert!(
+        manager.failures().await.is_empty(),
+        "a successful respawn must not mark failures: {:?}",
+        manager.failures().await
+    );
+    manager.shutdown().await;
+}
+
+/// A crash-looper: handshakes fine, exits as soon as any post-handshake
+/// request arrives. After the restart cap the server must be moved to
+/// `failures()` permanently and further calls surface the normal error
+/// instead of respawning forever.
+fn crash_looper_script() -> String {
+    r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2026-07-28","capabilities":{},"serverInfo":{"name":"crash-looper","version":"0"}}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      exit 1
+      ;;
+  esac
+done
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn crash_looper_is_parked_in_failures_after_cap() {
+    let manager = McpManager::start(
+        &[server("looper", "bash", &["-c", &crash_looper_script()])],
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("handshake succeeds: manager constructs");
+
+    // Cap is 3: calls 1-3 trigger respawn attempts, by call 4 the server
+    // is parked. Each call surfaces an error either way.
+    for i in 1..=4 {
+        let out = manager.call("looper/echo", serde_json::json!({})).await;
+        assert!(out.is_err(), "call {i} must fail: {out:?}");
+    }
+    let failures_now = manager.failures().await;
+    let failed: Vec<&str> = failures_now.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        failed,
+        ["looper"],
+        "crash-looper must be parked: {failed:?}"
+    );
+
+    // Further calls still surface the normal error (no respawn, no hang).
+    let out = manager
+        .call("looper/echo", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        out.to_string().contains("looper"),
+        "parked server's calls still name the server: {out}"
     );
     manager.shutdown().await;
 }

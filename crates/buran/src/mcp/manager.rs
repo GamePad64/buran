@@ -72,21 +72,30 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Spawned MCP servers plus a record of the ones that failed.
 ///
 /// Failures do not abort startup: the manager degrades to the servers that
-/// work, and doctor (Task 12) reports the rest.
+/// work, and doctor (Task 12) reports the rest. A server that dies later is
+/// respawned lazily on the next call; a server that exhausts the restart cap
+/// is parked in `failures` for the rest of the process.
 pub struct McpManager {
-    /// Original spawn configs, kept for lazy restart-on-call (hardening
-    /// v1.5.1): a dead transport is respawned from the config it was
-    /// started with.
-    // Read-only via the test accessor until the lazy-restart path lands
-    // (next commit); drop this allow then.
-    #[allow(dead_code)]
+    /// Original spawn configs: the restart source of truth. A dead
+    /// transport is respawned from the config it was started with.
     configs: Vec<McpServerConfig>,
     /// Interior mutability so `call`/`catalog` can respawn and reinsert
     /// clients lazily without `&mut self` (restarts are on-call, never a
     /// background health loop).
     clients: tokio::sync::Mutex<BTreeMap<String, McpClient>>,
-    failures: Vec<(String, String)>,
+    /// Startup failures plus servers parked after exhausting the restart
+    /// cap; mutex because parking happens at call time.
+    failures: tokio::sync::Mutex<Vec<(String, String)>>,
+    /// Lazy-restart counts per server; after [`RESTART_CAP`] respawns the
+    /// server is parked in `failures` and never respawned again.
+    restarts: tokio::sync::Mutex<BTreeMap<String, u32>>,
+    /// Spawn/handshake bound, carried from `start` so lazy restarts use the
+    /// same budget the initial spawn got.
+    spawn_timeout: Duration,
 }
+
+/// Lazy restarts per server before it is parked as permanently failed.
+const RESTART_CAP: u32 = 3;
 
 impl McpManager {
     /// Spawns every server and performs the MCP handshake, each bounded by
@@ -111,20 +120,16 @@ impl McpManager {
         Ok(Self {
             configs: configs.to_vec(),
             clients: tokio::sync::Mutex::new(clients),
-            failures,
+            failures: tokio::sync::Mutex::new(failures),
+            restarts: tokio::sync::Mutex::new(BTreeMap::new()),
+            spawn_timeout: timeout,
         })
     }
 
-    /// `(name, reason)` for every server that failed to spawn or handshake.
-    pub fn failures(&self) -> &[(String, String)] {
-        &self.failures
-    }
-
-    /// The configs this manager was started with (restart source of truth).
-    /// Test-only for now; the lazy-restart path reads it from `&self`.
-    #[cfg(test)]
-    pub(crate) fn stored_configs(&self) -> &[McpServerConfig] {
-        &self.configs
+    /// `(name, reason)` for every server that failed to spawn or handshake,
+    /// plus servers parked after exhausting the restart cap.
+    pub async fn failures(&self) -> Vec<(String, String)> {
+        self.failures.lock().await.clone()
     }
 
     /// The catalog of all tools across all healthy servers, qualified by
@@ -132,8 +137,23 @@ impl McpManager {
     /// silent server costs the catalog its timeout once, then drops out.
     pub async fn catalog(&self) -> ToolCatalog {
         let mut entries = Vec::new();
-        let clients = self.clients.lock().await;
-        for (server, client) in clients.iter() {
+        let servers: Vec<String> = self.clients.lock().await.keys().cloned().collect();
+        for server in servers {
+            // A transport that closed between calls gets one lazy respawn
+            // before its (bounded) tools/list attempt.
+            let probe_result = {
+                let clients = self.clients.lock().await;
+                clients
+                    .get(&server)
+                    .map(|client| client.is_transport_closed())
+            };
+            if probe_result == Some(true) && self.restart(&server).await.is_err() {
+                continue;
+            }
+            let clients = self.clients.lock().await;
+            let Some(client) = clients.get(&server) else {
+                continue;
+            };
             match tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await {
                 Ok(Ok(tools)) => {
                     for tool in tools {
@@ -142,6 +162,13 @@ impl McpManager {
                             tool,
                         });
                     }
+                }
+                Ok(Err(source)) if is_restartable(&source) => {
+                    // Transport died mid-list; a lazy respawn lets the
+                    // *next* catalog/call find the server alive. This
+                    // catalog degrades to zero tools from it.
+                    tracing::warn!(server = %server, %source, "tools/list failed; restarting");
+                    let _ = self.restart(&server).await;
                 }
                 Ok(Err(source)) => {
                     tracing::warn!(server = %server, %source, "tools/list failed");
@@ -164,6 +191,10 @@ impl McpManager {
     /// model-visible content, the model decides what to do with it.
     /// Bounded: a wedged server surfaces as a model-visible timeout error,
     /// never blocks the turn.
+    ///
+    /// A dead transport is respawned lazily from the stored config and the
+    /// call is retried once; after [`RESTART_CAP`] respawns the server is
+    /// parked in `failures()` and further calls fail immediately.
     pub async fn call(
         &self,
         qualified: &str,
@@ -173,9 +204,32 @@ impl McpManager {
             split_qualified(qualified).ok_or_else(|| McpError::UnknownTool {
                 name: qualified.to_string(),
             })?;
+
+        match self.try_call(server, tool_name, arguments.clone()).await {
+            Ok(out) => Ok(out),
+            Err(McpError::Call {
+                server,
+                source: CallErrorSource::Service(ref service_error),
+            }) if is_restartable(service_error) => {
+                // The transport died mid-call: respawn from the stored
+                // config and retry the original operation once.
+                self.restart(&server).await?;
+                self.try_call(&server, tool_name, arguments).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One bounded call attempt against the currently registered client.
+    async fn try_call(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolOutput, McpError> {
         let clients = self.clients.lock().await;
         let client = clients.get(server).ok_or_else(|| McpError::UnknownTool {
-            name: qualified.to_string(),
+            name: format!("{server}/{tool_name}"),
         })?;
 
         let arguments = match arguments {
@@ -207,6 +261,68 @@ impl McpManager {
         })
     }
 
+    /// Lazily respawns a server from its stored config, bumping the
+    /// per-server restart count. After [`RESTART_CAP`] attempts the server
+    /// is parked in `failures` and never respawned again.
+    ///
+    /// Holds no lock across the (multi-second) spawn; the lock guards only
+    /// counter/map mutations.
+    async fn restart(&self, server: &str) -> Result<(), McpError> {
+        // Parked servers never respawn: the cap is per process.
+        if self
+            .failures
+            .lock()
+            .await
+            .iter()
+            .any(|(name, _)| name == server)
+        {
+            return Err(McpError::UnknownTool {
+                name: format!("{server}/<parked>"),
+            });
+        }
+        {
+            let mut restarts = self.restarts.lock().await;
+            let count = restarts.entry(server.to_string()).or_insert(0);
+            if *count >= RESTART_CAP {
+                let reason = format!("restarted {RESTART_CAP} times, giving up");
+                tracing::warn!(server = %server, reason, "parking MCP server");
+                self.failures
+                    .lock()
+                    .await
+                    .push((server.to_string(), reason));
+                return Err(McpError::UnknownTool {
+                    name: format!("{server}/<parked>"),
+                });
+            }
+            *count += 1;
+        }
+
+        let config = self
+            .configs
+            .iter()
+            .find(|c| c.name == server)
+            .ok_or_else(|| McpError::UnknownTool {
+                name: server.to_string(),
+            })?;
+        match start_one(config, self.spawn_timeout).await {
+            Ok(client) => {
+                tracing::info!(server = %server, "respawned MCP server");
+                self.clients.lock().await.insert(server.to_string(), client);
+                Ok(())
+            }
+            Err(reason) => {
+                tracing::warn!(server = %server, reason, "MCP respawn failed");
+                self.failures
+                    .lock()
+                    .await
+                    .push((server.to_string(), reason));
+                Err(McpError::UnknownTool {
+                    name: format!("{server}/<respawn-failed>"),
+                })
+            }
+        }
+    }
+
     /// Shuts every server down, bounded per server; transports kill children
     /// on drop regardless.
     pub async fn shutdown(self) {
@@ -216,6 +332,16 @@ impl McpManager {
             }
         }
     }
+}
+
+/// True when the rmcp failure indicates the transport (child process) is
+/// gone rather than the tool merely returning an MCP-level error: only
+/// these are worth a lazy restart.
+fn is_restartable(error: &rmcp::ServiceError) -> bool {
+    matches!(
+        error,
+        rmcp::ServiceError::TransportClosed | rmcp::ServiceError::TransportSend(_)
+    )
 }
 
 /// Splits `"server/tool"` into `("server", "tool")`. Tool names may contain

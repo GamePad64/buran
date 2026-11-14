@@ -125,6 +125,7 @@ pub async fn run_doctor(
     };
     let failures: std::collections::BTreeMap<String, String> = manager
         .failures()
+        .await
         .iter()
         .map(|(name, reason)| (name.clone(), reason.clone()))
         .collect();
