@@ -11,10 +11,12 @@ section honest as tools change.
 ## Method (how the numbers are taken)
 
 All measurements on one development machine (Linux x86_64, wayland, kernel
-7.0.0-43), taken 2026-11-14. Where an LLM roundtrip is involved, all agents
-talk to the **same LiteLLM-style gateway** (`http://172.21.2.30:4000`,
-model `chat-router`), one-shot prompt "Reply with exactly one word: ping",
-so latency differences are agent-side only.
+7.0.0-43), buran column refreshed 2026-11-14 on the fat-LTO + strip
+release profile (ADR 0008 budgets gate this column). Where an LLM
+roundtrip is involved, all agents talk to the **same LiteLLM-style
+gateway** (`http://172.21.2.30:4000`, model `chat-router`), one-shot
+prompt "Reply with exactly one word: ping", so latency differences are
+agent-side only.
 
 - **RSS** = `VmRSS` from `/proc/<pid>/status`, sampled by polling every
   30–50 ms during the measured window (peak), or read once after settle
@@ -35,16 +37,16 @@ so latency differences are agent-side only.
 
 ## The table
 
-| Metric | buran 0.1.0 | pi 1.5.2 | Claude Code 2.1.310 | opencode |
+| Metric | buran 0.1.0 (fat LTO + strip) | pi 1.5.2 | Claude Code 2.1.310 | opencode |
 |---|---|---|---|---|
-| Binary / install size | **8.8 MB** (single stripped ELF) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
-| Idle process RSS | **2.7 MB** (serve, waiting) | — | — | not measured |
-| One process, one active session | **6.8 MB** | ~104–148 MB (node runtime floor ~45 MB) | ~100–400 MB per process | not measured |
+| Binary / install size | **9.0 MB** buran + **3.9 MB** buran-tui (two stripped ELFs) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
+| Idle process RSS | **~6.2 MB** (serve, waiting) | — | — | not measured |
+| One process, one active session (prompt-turn peak) | **8.8–9.0 MB** | ~104–148 MB (node runtime floor ~45 MB) | ~100–400 MB per process | not measured |
 | Interactive fleet (this machine, just now) | n/a (one process per session by design) | 148 MB (one TUI, 90 min) | **1 754 MB** total: 11 `bg-spare` processes 77–405 MB each + daemon 99 MB + `agents` 147 MB | not measured |
-| Cold start (spawn → accepts first RPC) | **p50 2 ms** (10 runs, max 4 ms) | ~0.4 s to config-loaded failure; ~1 s+ warm one-shot end-to-end | seconds (node + 350 MB tree) | not measured |
-| One-shot prompt roundtrip (same gateway) | **16–34 ms** agent-side overhead (5 runs: 16/17/24/25/27; ~1.4 s wall incl. LLM) | 0.5–3.4 s wall (LiteLLM discovery on cold runs; warm ~0.5–1.4 s) | not comparable headless (bg-spare fleet is the resident cost) | not measured |
+| Cold start (spawn → accepts first RPC) | **p50 8 ms** (10 runs, min 2, max 11) | ~0.4 s to config-loaded failure; ~1 s+ warm one-shot end-to-end | seconds (node + 350 MB tree) | not measured |
+| One-shot prompt roundtrip (same gateway) | **18–25 ms** agent-side overhead (3 runs; wall 0.4–1.7 s incl. LLM — gateway varies) | 0.5–3.4 s wall (LiteLLM discovery on cold runs; warm ~0.5–1.4 s) | not comparable headless (bg-spare fleet is the resident cost) | not measured |
 | Runtime dependencies | **none** (statically linked musl/gnu targets; node not needed) | node 26 (bundled via pi-node), npm tree | node (bundled), npm tree | node/bun |
-| Uninstall = | `rm` one file | `rm -rf ~/.pi` (314 MB) | `rm -rf` 350 MB + plugin cache | — |
+| Uninstall = | `rm` two files | `rm -rf ~/.pi` (314 MB) | `rm -rf` 350 MB + plugin cache | — |
 
 ## Honest caveats
 
@@ -74,8 +76,8 @@ regress past the resource budgets (ADR 0008), that's a release blocker —
 the whole point of the table is that the differentiator stays true.
 
 Budget line, from ADR 0008: session RSS ≤ 10 MB, cold start ≤ 100 ms,
-stripped binary ≤ 15 MB. Current: 6.8 MB / 2 ms / 8.8 MB — all green with
-headroom.
+stripped binary ≤ 15 MB. Current: 8.8–9.0 MB / 8 ms / 9.0 MB — all green;
+RSS headroom narrowed with fat LTO (6.8 → 8.8 MB peak), worth watching.
 
 ## Reproducing
 
