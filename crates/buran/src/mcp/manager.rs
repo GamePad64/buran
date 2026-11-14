@@ -74,7 +74,17 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Failures do not abort startup: the manager degrades to the servers that
 /// work, and doctor (Task 12) reports the rest.
 pub struct McpManager {
-    clients: BTreeMap<String, McpClient>,
+    /// Original spawn configs, kept for lazy restart-on-call (hardening
+    /// v1.5.1): a dead transport is respawned from the config it was
+    /// started with.
+    // Read-only via the test accessor until the lazy-restart path lands
+    // (next commit); drop this allow then.
+    #[allow(dead_code)]
+    configs: Vec<McpServerConfig>,
+    /// Interior mutability so `call`/`catalog` can respawn and reinsert
+    /// clients lazily without `&mut self` (restarts are on-call, never a
+    /// background health loop).
+    clients: tokio::sync::Mutex<BTreeMap<String, McpClient>>,
     failures: Vec<(String, String)>,
 }
 
@@ -98,7 +108,11 @@ impl McpManager {
             }
         }
 
-        Ok(Self { clients, failures })
+        Ok(Self {
+            configs: configs.to_vec(),
+            clients: tokio::sync::Mutex::new(clients),
+            failures,
+        })
     }
 
     /// `(name, reason)` for every server that failed to spawn or handshake.
@@ -106,12 +120,20 @@ impl McpManager {
         &self.failures
     }
 
+    /// The configs this manager was started with (restart source of truth).
+    /// Test-only for now; the lazy-restart path reads it from `&self`.
+    #[cfg(test)]
+    pub(crate) fn stored_configs(&self) -> &[McpServerConfig] {
+        &self.configs
+    }
+
     /// The catalog of all tools across all healthy servers, qualified by
     /// server name: `"server-name/tool-name"`. Bounded per server: a
     /// silent server costs the catalog its timeout once, then drops out.
     pub async fn catalog(&self) -> ToolCatalog {
         let mut entries = Vec::new();
-        for (server, client) in &self.clients {
+        let clients = self.clients.lock().await;
+        for (server, client) in clients.iter() {
             match tokio::time::timeout(LIST_TIMEOUT, client.list_all_tools()).await {
                 Ok(Ok(tools)) => {
                     for tool in tools {
@@ -151,12 +173,10 @@ impl McpManager {
             split_qualified(qualified).ok_or_else(|| McpError::UnknownTool {
                 name: qualified.to_string(),
             })?;
-        let client = self
-            .clients
-            .get(server)
-            .ok_or_else(|| McpError::UnknownTool {
-                name: qualified.to_string(),
-            })?;
+        let clients = self.clients.lock().await;
+        let client = clients.get(server).ok_or_else(|| McpError::UnknownTool {
+            name: qualified.to_string(),
+        })?;
 
         let arguments = match arguments {
             serde_json::Value::Object(map) => map,
@@ -190,7 +210,7 @@ impl McpManager {
     /// Shuts every server down, bounded per server; transports kill children
     /// on drop regardless.
     pub async fn shutdown(self) {
-        for (name, mut client) in self.clients {
+        for (name, mut client) in self.clients.into_inner() {
             if let Err(error) = client.close_with_timeout(Duration::from_secs(3)).await {
                 tracing::warn!(server = %name, %error, "MCP server shutdown error");
             }
@@ -207,6 +227,9 @@ fn split_qualified(qualified: &str) -> Option<(&str, &str)> {
     }
     Some((server, tool))
 }
+
+#[cfg(test)]
+mod tests;
 
 async fn start_one(config: &McpServerConfig, timeout: Duration) -> Result<McpClient, String> {
     let mut command = tokio::process::Command::new(&config.command);

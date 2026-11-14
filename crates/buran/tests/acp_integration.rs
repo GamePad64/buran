@@ -1523,8 +1523,9 @@ async fn load_session_advertises_modes() {
         let cwd = cwd1.clone();
         async move {
             initialize(&cx).await?;
-            let SessionSetup { session, response, .. } =
-                cx.build_session(cwd).block_task().start_session().await?;
+            let SessionSetup {
+                session, response, ..
+            } = cx.build_session(cwd).block_task().start_session().await?;
             *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
             let mut session = session;
             session.send_prompt("hi")?;
@@ -1558,8 +1559,15 @@ async fn load_session_advertises_modes() {
         let cwd = cwd2.clone();
         async move {
             initialize(&cx).await?;
-            let SessionSetup { mut session, response, .. } =
-                cx.load_session(id, cwd).block_task().start_session().await?;
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx
+                .load_session(id, cwd)
+                .block_task()
+                .start_session()
+                .await?;
             let modes = response
                 .modes
                 .expect("loadSession must advertise the policy modes");
