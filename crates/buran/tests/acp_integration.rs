@@ -1216,9 +1216,9 @@ async fn usage_chunk_is_persisted_as_usage_record() {
         text_chunk("Hello"),
         r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
     );
-    m.push_response_frames(sse(vec![Box::leak(format!(
-        "{body}\n\ndata: [DONE]\n\n"
-    ).into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(
+        format!("{body}\n\ndata: [DONE]\n\n").into_boxed_str(),
+    )]));
     let m2 = m.clone();
 
     let mut config = test_config(Vec::new());
@@ -1284,9 +1284,9 @@ async fn transcript_with_usage_record_resumes_cleanly() {
         text_chunk("the magic word is FROB"),
         r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#,
     );
-    m.push_response_frames(sse(vec![Box::leak(format!(
-        "{body}\n\ndata: [DONE]\n\n"
-    ).into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(
+        format!("{body}\n\ndata: [DONE]\n\n").into_boxed_str(),
+    )]));
     let m2 = m.clone();
 
     let mut config = test_config(Vec::new());
@@ -1365,4 +1365,131 @@ async fn transcript_with_usage_record_resumes_cleanly() {
         .await
         .expect("timed out")
         .expect("conn failed");
+}
+
+/// `session/set_mode` (hardening v1.5.1): newSession advertises the three
+/// policy modes; `deny_all` takes effect per-session without a permission
+/// round-trip; an unknown mode id is an error and leaves policy unchanged.
+#[tokio::test(flavor = "current_thread")]
+async fn set_mode_overrides_policy_per_session() {
+    use agent_client_protocol::v1::schema::{
+        PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, SelectedPermissionOutcome, SetSessionModeRequest,
+        SetSessionModeResponse,
+    };
+    use agent_client_protocol::{ErrorCode, on_receive_request};
+
+    let m = MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(tool_call_body().into_boxed_str())]));
+    let turn2 = format!("data: {}\n\n{}", text_chunk("understood"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+    let m3 = m2.clone();
+
+    // Ask policy from config: the set_mode("deny_all") must override it —
+    // no request_permission may reach the client handler below.
+    let mut config = test_config(Vec::new());
+    config.permission = buran::config::PermissionPolicy::Ask;
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m3.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked_handler = asked.clone();
+    let client = Client
+        .v1()
+        .on_receive_request(
+            async |request: RequestPermissionRequest, responder, _cx| {
+                asked_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                // The test asserts this handler never runs under deny_all;
+                // still answer correctly in case it does.
+                let reject_id = request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+                    .map(|option| option.option_id.clone());
+                if let Some(id) = reject_id {
+                    let _ = responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+                    ));
+                }
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+            on_receive_request!(),
+        )
+        .connect_with(agent, async move |cx| {
+            initialize(&cx).await?;
+            // SessionSetup.response carries the full NewSessionResponse,
+            // so the advertised modes are observable here.
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx.build_session_cwd()?.block_task().start_session().await?;
+            let modes = response
+                .modes
+                .expect("newSession must advertise the policy modes");
+            assert_eq!(modes.available_modes.len(), 3);
+            let ids: Vec<_> = modes
+                .available_modes
+                .iter()
+                .map(|m| m.id.0.as_ref().to_owned())
+                .collect();
+            assert!(ids.contains(&"allow_all".to_string()));
+            assert!(ids.contains(&"deny_all".to_string()));
+            assert!(ids.contains(&"ask".to_string()));
+            assert_eq!(
+                modes.current_mode_id.0.as_ref(),
+                "ask",
+                "current mode mirrors the configured policy"
+            );
+
+            // Switch to deny_all.
+            let session_id = response.session_id.clone();
+            let _set: SetSessionModeResponse = cx
+                .send_request(SetSessionModeRequest::new(
+                    session_id.clone(),
+                    agent_client_protocol::v1::schema::SessionModeId::new("deny_all"),
+                ))
+                .block_task()
+                .await
+                .expect("set_mode ok");
+
+            // Unknown mode id must error.
+            let err = cx
+                .send_request(SetSessionModeRequest::new(
+                    session_id.clone(),
+                    agent_client_protocol::v1::schema::SessionModeId::new("bogus"),
+                ))
+                .block_task()
+                .await;
+            assert_eq!(err.unwrap_err().code, ErrorCode::INVALID_PARAMS);
+
+            // Drive a tool call: deny_all decides without asking the client.
+            session.send_prompt("read it")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+
+    assert!(
+        !asked.load(std::sync::atomic::Ordering::SeqCst),
+        "deny_all must not send request_permission"
+    );
+    // Round 2 carries the denial tool result.
+    let requests = m2.requests();
+    assert_eq!(requests.len(), 2, "two LLM rounds");
+    assert!(
+        body_contains(&requests[1], "denied by user"),
+        "denial tool result must be in the continuation request"
+    );
 }

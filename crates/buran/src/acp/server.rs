@@ -15,8 +15,9 @@ use agent_client_protocol::{
     v1::schema::{
         AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
         InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-        NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionNotification,
-        SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
+        NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
+        SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+        SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
         ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     },
 };
@@ -46,6 +47,10 @@ struct SessionHandle {
     /// empty and fork the conversation. MVP is one turn per session — the
     /// second prompt is rejected until the first resolves.
     turn_in_flight: bool,
+    /// Per-session permission policy (hardening v1.5.1): set through
+    /// `session/set_mode`, overriding the config default for this session
+    /// only. `None` means "use `config.permission`".
+    permission_override: Option<PermissionPolicy>,
 }
 
 /// Why a prompt turn failed: before it started (a request-level rejection
@@ -63,7 +68,9 @@ struct ServerState {
     store: crate::store::Store,
     mcp: Arc<McpManager>,
     llm_factory: LlmFactory,
-    sessions: Mutex<HashMap<SessionId, SessionHandle>>,
+    /// Shared with the per-turn event pump (`tokio::spawn` needs `'static`),
+    /// which reads the session's effective permission policy per query.
+    sessions: Arc<Mutex<HashMap<SessionId, SessionHandle>>>,
 }
 
 /// Builds the buran ACP agent from the real filesystem config and an
@@ -136,7 +143,7 @@ pub async fn agent_builder_with_config(
         store,
         mcp: Arc::new(mcp),
         llm_factory: Arc::new(llm_factory),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
     });
 
     Ok(build_agent(state, provider_for_agent))
@@ -158,6 +165,7 @@ fn build_agent(
     let state_load = state.clone();
     let state_prompt = state.clone();
     let state_cancel = state.clone();
+    let state_set_mode = state.clone();
     let provider_new_session = provider.clone();
     let provider_prompt = provider.clone();
 
@@ -230,9 +238,16 @@ fn build_agent(
                             cancel_tx,
                             store_file,
                             turn_in_flight: false,
+                            permission_override: None,
                         },
                     );
-                responder.respond(NewSessionResponse::new(session_id))
+                // Modes advertise the effective policy (the config value at
+                // session start); the client can switch per session via
+                // `session/set_mode` (hardening v1.5.1).
+                responder.respond(
+                    NewSessionResponse::new(session_id)
+                        .modes(permission_modes(state_new_session.config.permission)),
+                )
             },
             on_receive_request!(),
         )
@@ -289,6 +304,7 @@ fn build_agent(
                         cancel_tx: watch::channel(false).0,
                         turn_in_flight: false,
                         store_file: Some(file),
+                        permission_override: None,
                     })
                 })();
                 match load_result {
@@ -298,12 +314,51 @@ fn build_agent(
                             .lock()
                             .expect("sessions lock")
                             .insert(req.session_id.clone(), handle);
-                        let _ = responder.respond(LoadSessionResponse::new());
+                        // Parity with newSession (hardening v1.5.1): the
+                        // loaded session advertises the same three modes.
+                        let _ = responder.respond(
+                            LoadSessionResponse::new()
+                                .modes(permission_modes(state_load.config.permission)),
+                        );
                     }
                     Err(e) => {
                         let _ = responder.respond_with_error(agent_client_protocol::Error::new(
                             agent_client_protocol::ErrorCode::INVALID_PARAMS,
                             format!("{e}"),
+                        ));
+                    }
+                }
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: SetSessionModeRequest, responder, _cx| {
+                // Per-session policy override (hardening v1.5.1): the mode
+                // id maps to a policy stored on the handle; the event pump
+                // reads it per query. Unknown ids are INVALID_PARAMS and
+                // leave the policy untouched.
+                let policy = policy_for_mode_id(req.mode_id.0.as_ref());
+                match policy {
+                    Some(policy) => {
+                        let mut sessions = state_set_mode.sessions.lock().expect("sessions lock");
+                        if let Some(handle) = sessions.get_mut(&req.session_id) {
+                            handle.permission_override = Some(policy);
+                            drop(sessions);
+                            let _ = responder.respond(SetSessionModeResponse::new());
+                        } else {
+                            drop(sessions);
+                            let _ =
+                                responder.respond_with_error(agent_client_protocol::Error::new(
+                                    agent_client_protocol::ErrorCode::INVALID_PARAMS,
+                                    format!("unknown session {}", req.session_id.0),
+                                ));
+                        }
+                    }
+                    None => {
+                        let _ = responder.respond_with_error(agent_client_protocol::Error::new(
+                            agent_client_protocol::ErrorCode::INVALID_PARAMS,
+                            format!("unknown mode {}", req.mode_id.0),
                         ));
                     }
                 }
@@ -516,16 +571,27 @@ async fn run_prompt_turn_inner(
     let message_id = MessageIdClock::start();
 
     // Event pump: TurnEvents → session/update notifications; permission
-    // queries follow the config policy — Ask round-trips the client (in
-    // this spawned task, never on the dispatch loop), AllowAll/DenyAll
-    // decide locally.
-    let policy = state.config.permission;
+    // queries follow the session's effective policy — the per-session
+    // override from `session/set_mode` when set, else the config default
+    // (hardening v1.5.1). Ask round-trips the client (in this spawned
+    // task, never on the dispatch loop); AllowAll/DenyAll decide locally.
+    // The override is read per query: a set_mode issued while a turn runs
+    // takes effect for the remaining calls of that same turn.
+    let default_policy = state.config.permission;
     let permission_timeout = state.config.permission_timeout;
+    let sessions_for_pump = Arc::clone(&state.sessions);
     let conn2 = conn.clone();
     let pump = tokio::spawn(async move {
         while let Some(event) = events_rx.recv().await {
             match event {
                 TurnEvent::PermissionQuery(query) => {
+                    let policy = {
+                        let sessions = sessions_for_pump.lock().expect("sessions lock");
+                        sessions
+                            .get(&session_id)
+                            .and_then(|h| h.permission_override)
+                            .unwrap_or(default_policy)
+                    };
                     let decision = match policy {
                         PermissionPolicy::AllowAll => PermissionDecision::Allow,
                         PermissionPolicy::DenyAll => PermissionDecision::Deny,
@@ -689,6 +755,41 @@ fn new_session_id() -> String {
     // chronological order — `--resume latest` resolves by filename
     // without file contents (sessions store spec).
     uuid::Uuid::now_v7().to_string()
+}
+
+/// Session-mode ids advertised over ACP (hardening v1.5.1): each maps to
+/// one `PermissionPolicy`. Clients switch via `session/set_mode`.
+const MODE_ALLOW_ALL: &str = "allow_all";
+const MODE_DENY_ALL: &str = "deny_all";
+const MODE_ASK: &str = "ask";
+
+/// The three policy modes as an ACP `SessionModeState`, with `current`
+/// as the effective policy (the override if set, else the config value).
+fn permission_modes(current: PermissionPolicy) -> SessionModeState {
+    let current_id = match current {
+        PermissionPolicy::AllowAll => MODE_ALLOW_ALL,
+        PermissionPolicy::DenyAll => MODE_DENY_ALL,
+        PermissionPolicy::Ask => MODE_ASK,
+    };
+    SessionModeState::new(
+        SessionModeId::new(current_id),
+        vec![
+            SessionMode::new(MODE_ALLOW_ALL, "Allow all"),
+            SessionMode::new(MODE_DENY_ALL, "Deny all"),
+            SessionMode::new(MODE_ASK, "Ask"),
+        ],
+    )
+}
+
+/// Maps a `session/set_mode` id to its policy; unknown ids are None (the
+/// handler answers INVALID_PARAMS).
+fn policy_for_mode_id(mode: &str) -> Option<PermissionPolicy> {
+    match mode {
+        MODE_ALLOW_ALL => Some(PermissionPolicy::AllowAll),
+        MODE_DENY_ALL => Some(PermissionPolicy::DenyAll),
+        MODE_ASK => Some(PermissionPolicy::Ask),
+        _ => None,
+    }
 }
 
 /// Test seam: integration suite asserts the ID format contract.
