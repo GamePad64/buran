@@ -29,6 +29,12 @@ enum Command {
         /// conversation to attach to").
         #[arg(long, conflicts_with = "resume")]
         fork: Option<String>,
+        /// Serve ACP over HTTP/1.1 + WebSocket on this address instead
+        /// of stdio (ADR 0010): `--listen 127.0.0.1:8080`. Bind is the
+        /// caller's business: loopback by default, a reverse proxy owns
+        /// TLS/auth beyond it. Without the flag, stdio.
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
     },
     /// Probe config and MCP servers, offer ACT on first run
     Doctor,
@@ -63,8 +69,13 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve {
         resume: None,
         fork: None,
+        listen: None,
     }) {
-        Command::Serve { resume, fork } => buran::run::serve(resume, fork),
+        Command::Serve {
+            resume,
+            fork,
+            listen,
+        } => buran::run::serve(resume, fork, listen),
         Command::Doctor => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

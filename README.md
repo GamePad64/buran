@@ -103,9 +103,15 @@ Resume semantics: `serve` validates the id before the ACP channel opens; a clien
 
 The client may call only `initialize / newSession / loadSession / prompt / stop / setSessionMode / setSessionModel`. Filesystem and terminal access live on the client side; the LLM loop and tool execution live on the agent side.
 
+## Transports: stdio (default), HTTP, socket
+
+- **stdio** is the default and the seam `buran-tui`, Zed, and `ssh host -- buran serve` use.
+- **HTTP**: `buran serve --listen 127.0.0.1:8080` serves ACP over HTTP/1.1 + WebSocket on `/acp` (plus `GET /health`) via the official [`agent-client-protocol-http`](https://crates.io/crates/agent-client-protocol-http) stack — one connection per ACP session, each with its own MCP children (ADR 0010). Works natively on Windows, macOS, Linux. HTTP/2 is a deliberate later amendment; TLS and auth beyond loopback belong to the reverse proxy in front (caddy/nginx), not to buran.
+- **Unix socket / TCP without HTTP**: stdio is transport-agnostic, so `socat UNIX-LISTEN:buran.sock,fork EXEC:buran serve` (or `TCP-LISTEN:...`) fronts it with zero code — the Unix recipe; Windows has `--listen` instead.
+
 ## HTTP: hclient
 
-All HTTP goes through [hclient](https://github.com/GamePad64/hclient) — sans-io at the core, native transport (tokio + rustls), its own SSE decoding for streaming responses, and `hclient-mock` for tests. No reqwest, no hand-rolled SSE, no provider SDKs.
+All outbound HTTP goes through [hclient](https://github.com/GamePad64/hclient) — sans-io at the core, native transport (tokio + rustls), its own SSE decoding for streaming responses, and `hclient-mock` for tests. No reqwest, no hand-rolled SSE, no provider SDKs. The `--listen` server side is the official ACP HTTP transport crate, not a buran-built stack.
 
 ## License
 

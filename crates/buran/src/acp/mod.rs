@@ -6,4 +6,7 @@ mod server;
 pub use permissions::request_permission;
 #[doc(hidden)]
 pub use server::new_session_id_for_test;
-pub use server::{agent_builder_with_config, agent_builder_with_factory, serve, serve_with};
+pub use server::{
+    agent_builder_with_config, agent_builder_with_factory, serve, serve_listen, serve_listen_with,
+    serve_with,
+};

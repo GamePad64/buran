@@ -6,8 +6,32 @@ use anyhow::Result;
 /// Resume/fork are pre-flight validation plus a stderr hint: ACP clients
 /// attach to stored conversations via `session/loadSession` (ADR 0007
 /// canon; the store is the contract), so serve only ensures the
-/// transcript is reachable before the ACP channel opens.
-pub fn serve(resume: Option<String>, fork: Option<String>) -> Result<()> {
+/// transcript is reachable before the ACP channel opens. `listen` (ADR
+/// 0010) switches the transport to HTTP on `addr`; it is transport-only —
+/// resume/fork stay stdio for now and combining them is rejected rather
+/// than silently ignored.
+pub fn serve(
+    resume: Option<String>,
+    fork: Option<String>,
+    listen: Option<std::net::SocketAddr>,
+) -> Result<()> {
+    if listen.is_some() && (resume.is_some() || fork.is_some()) {
+        anyhow::bail!(
+            "--listen does not support --resume/--fork yet: HTTP connections are fresh sessions; drop --listen or --resume/--fork"
+        );
+    }
+    if let Some(addr) = listen {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let bound = rt.block_on(crate::acp::serve_listen(addr, crate::llm::LlmClient::new))?;
+        eprintln!("buran ACP listening on http://{bound}/acp (HTTP/1.1 + WebSocket)");
+        // Serve until Ctrl-C: the listener task dies with the runtime.
+        rt.block_on(async {
+            let _ = tokio::signal::ctrl_c().await;
+        });
+        return Ok(());
+    }
     let store = crate::store::Store::new(crate::store::Store::default_root());
     let effective = if let Some(id) = fork {
         // A CLI fork is "the same conversation, new branch": the fork head

@@ -37,14 +37,14 @@ agent-side only.
 
 ## The table
 
-| Metric | buran 0.1.0 (fat LTO + strip) | pi 1.5.2 | Claude Code 2.1.310 | opencode |
+| Metric | buran 0.1.0 (fat LTO + strip, HTTP listener) | pi 1.5.2 | Claude Code 2.1.310 | opencode |
 |---|---|---|---|---|
-| Binary / install size | **9.0 MB** buran + **3.9 MB** buran-tui (two stripped ELFs) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
+| Binary / install size | **10.3 MB** buran + **3.9 MB** buran-tui (two stripped ELFs; +1.3 MB = axum stack for `--listen`, ADR 0010) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
 | Idle process RSS | **~6.2 MB** (serve, waiting) | — | — | not measured |
-| One process, one active session (prompt-turn peak) | **8.8–9.0 MB** | ~104–148 MB (node runtime floor ~45 MB) | ~100–400 MB per process | not measured |
-| Interactive fleet (this machine, just now) | n/a (one process per session by design) | 148 MB (one TUI, 90 min) | **1 754 MB** total: 11 `bg-spare` processes 77–405 MB each + daemon 99 MB + `agents` 147 MB | not measured |
-| Cold start (spawn → accepts first RPC) | **p50 8 ms** (10 runs, min 2, max 11) | ~0.4 s to config-loaded failure; ~1 s+ warm one-shot end-to-end | seconds (node + 350 MB tree) | not measured |
-| One-shot prompt roundtrip (same gateway) | **18–25 ms** agent-side overhead (3 runs; wall 0.4–1.7 s incl. LLM — gateway varies) | 0.5–3.4 s wall (LiteLLM discovery on cold runs; warm ~0.5–1.4 s) | not comparable headless (bg-spare fleet is the resident cost) | not measured |
+| One process, one active session (prompt-turn peak) | **9.5–9.6 MB** (was 8.8–9.0 pre-axum; budget 10 MB — headroom ~0.4 MB, watched) | ~104–148 MB (node runtime floor ~45 MB) | ~100–400 MB per process | not measured |
+| Interactive fleet (this machine, just now) | n/a (one process per session by design; N HTTP sessions share one process) | 148 MB (one TUI, 90 min) | **1 754 MB** total: 11 `bg-spare` processes 77–405 MB each + daemon 99 MB + `agents` 147 MB | not measured |
+| Cold start (spawn → accepts first RPC) | **p50 4 ms** (10 runs, min 2, max 7) | ~0.4 s to config-loaded failure; ~1 s+ warm one-shot end-to-end | seconds (node + 350 MB tree) | not measured |
+| One-shot prompt roundtrip (same gateway) | **18–25 ms** agent-side overhead (wall 0.4–1.7 s incl. LLM — gateway varies) | 0.5–3.4 s wall (LiteLLM discovery on cold runs; warm ~0.5–1.4 s) | not comparable headless (bg-spare fleet is the resident cost) | not measured |
 | Runtime dependencies | **none** (statically linked musl/gnu targets; node not needed) | node 26 (bundled via pi-node), npm tree | node (bundled), npm tree | node/bun |
 | Uninstall = | `rm` two files | `rm -rf ~/.pi` (314 MB) | `rm -rf` 350 MB + plugin cache | — |
 
@@ -76,8 +76,10 @@ regress past the resource budgets (ADR 0008), that's a release blocker —
 the whole point of the table is that the differentiator stays true.
 
 Budget line, from ADR 0008: session RSS ≤ 10 MB, cold start ≤ 100 ms,
-stripped binary ≤ 15 MB. Current: 8.8–9.0 MB / 8 ms / 9.0 MB — all green;
-RSS headroom narrowed with fat LTO (6.8 → 8.8 MB peak), worth watching.
+stripped binary ≤ 15 MB. Current: 9.5–9.6 MB / 4 ms / 10.3 MB — green,
+but RSS headroom is now ~0.4 MB (fat LTO took the peak 6.8 → 8.8 MB;
+the axum stack for `--listen` added ~0.7 more). The next feature with resident cost amends ADR 0008
+first.
 
 ## Reproducing
 

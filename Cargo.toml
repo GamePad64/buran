@@ -18,6 +18,8 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
+agent-client-protocol-http = { version = "5", default-features = false, features = ["server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 # Binary-size budget (ADR 0008): fat LTO + one codegen unit + strip keeps
 # buran at ~9 MB stripped (11.1 MB unstripped, 8.8 MB pre-LTO); budgets

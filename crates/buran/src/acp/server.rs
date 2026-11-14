@@ -839,3 +839,67 @@ pub async fn serve_with(
         .await
         .map_err(|error| anyhow::anyhow!("ACP connection failed: {error}"))
 }
+
+/// `serve --listen <addr>` (ADR 0010): ACP over HTTP/1.1 + WebSocket on
+/// `/acp` via the official `agent-client-protocol-http` server stack. No
+/// flag = stdio (the FIXED contract); the listener is additive. Each
+/// connection gets a fresh builder → its own MCP children; the crate's
+/// connection registry is the whole multi-session surface (no
+/// orchestrator of our own). Returns the bound address so `:0` callers
+/// (tests) learn where it landed; serving runs until the runtime drops.
+///
+/// The HTTP/2 feature is deliberately off (owner decision, 2026-11-14):
+/// one feature line + the `h2` crate brings it when wanted.
+pub async fn serve_listen(
+    addr: std::net::SocketAddr,
+    llm_factory: impl Fn(&ProviderConfig) -> Result<LlmClient, LlmError> + Send + Sync + 'static,
+) -> anyhow::Result<std::net::SocketAddr> {
+    let config = Config::load(std::env::current_dir().ok().as_deref(), |var| {
+        std::env::var(var).ok()
+    })?;
+    serve_listen_with(addr, config, llm_factory).await
+}
+
+/// `serve_listen` with an explicit config (tests inject skills dirs,
+/// policies, mock providers). Each connection builds the agent from this
+/// one config snapshot: config is read once at listen time, like the
+/// stdio path reads it once at startup.
+pub async fn serve_listen_with(
+    addr: std::net::SocketAddr,
+    config: Config,
+    llm_factory: impl Fn(&ProviderConfig) -> Result<LlmClient, LlmError> + Send + Sync + 'static,
+) -> anyhow::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| anyhow::anyhow!("bind {addr}: {error}"))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|error| anyhow::anyhow!("bound addr: {error}"))?;
+
+    // AcpHttpServer calls the factory once per connection; each call
+    // re-spawns MCP servers from the shared config, mirroring the
+    // per-process isolation of the stdio path. The crate wants a *sync*
+    // factory returning the builder, but builder construction awaits MCP
+    // server startup — inside axum's worker threads that future is driven
+    // with block_in_place + Handle::block_on (legal on the multi-thread
+    // runtime serve already requires; panics nowhere else).
+    let factory: LlmFactory = std::sync::Arc::new(llm_factory);
+    let router = agent_client_protocol_http::AcpHttpServer::new(move || {
+        let factory = factory.clone();
+        let config = config.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(move || {
+            handle
+                .block_on(agent_builder_with_config(config, move |p| factory(p)))
+                .expect("agent builder construction on connection")
+        })
+    })
+    .into_router();
+
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::error!("ACP HTTP listener failed: {error}");
+        }
+    });
+    Ok(bound)
+}
