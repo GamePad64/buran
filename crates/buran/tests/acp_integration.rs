@@ -1825,3 +1825,83 @@ async fn resumed_session_appends_after_existing_records_in_order() {
         .expect("timed out")
         .expect("conn failed");
 }
+
+/// The streak guard is ON in production (spec: "threshold defaults 4";
+/// review Important #1): a server-driven turn where the model emits the
+/// identical tool call every round is cut after 4 identical rounds — the
+/// turn ends with a system note in the transcript, not a 5th execution.
+#[tokio::test(flavor = "current_thread")]
+async fn production_turn_cuts_runaway_tool_loop_after_four_identical_rounds() {
+    use TranscriptRecord::Message;
+
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    // 6 identical tool-call rounds queued; a wired guard consumes 4 and
+    // cuts the 5th round's request — the 5th and 6th responses are never
+    // fetched. Without the guard, all 5 fetchable rounds run (the turn
+    // would only stop at max_turns=32).
+    for _ in 0..6 {
+        m.push_response_frames(sse(vec![Box::leak(tool_call_body().into_boxed_str())]));
+    }
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    // AllowAll: the guard (not a permission denial) is the only thing that
+    // can stop the turn.
+    config.permission = buran::config::PermissionPolicy::AllowAll;
+
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let dir_path = dir.path().to_path_buf();
+    let client = Client.v1().connect_with(agent, async move |cx| {
+        initialize(&cx).await?;
+        let SessionSetup {
+            mut session,
+            response,
+            ..
+        } = cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("read the file forever")?;
+        let _ = session.read_to_string().await?;
+
+        // Poll the transcript for the cut: the guard appends a system
+        // note naming the loop guard.
+        let id = response.session_id.0.to_string();
+        let store = buran::store::Store::new(&dir_path);
+        let mut cut_note = false;
+        for _ in 0..50 {
+            let (_, records) = store.open(&id).expect("transcript readable");
+            cut_note = records.iter().any(
+                |r| matches!(r, Message(msg) if msg.role == buran::llm::types::Role::System && msg.content.as_deref().unwrap_or("").contains("loop guard")),
+            );
+            if cut_note {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            cut_note,
+            "production turn must cut the runaway loop with a system note"
+        );
+        // The cut means exactly 4 tool executions ran, not 5.
+        let (_, records) = store.open(&id).unwrap();
+        let user_turns = records.iter().filter(|r| matches!(r, Message(_))).count();
+        assert!(
+            user_turns < 12,
+            "guard must cut before consuming all queued rounds: {user_turns} messages"
+        );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}

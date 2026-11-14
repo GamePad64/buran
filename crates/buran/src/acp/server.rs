@@ -575,7 +575,11 @@ async fn run_prompt_turn_inner(
     let tools: Arc<McpManager> = state.mcp.clone();
     let loop_ = AgentLoop::new(llm, tools, system_prompt)
         .with_catalog(&catalog)
-        .with_skills(skills);
+        .with_skills(skills)
+        // Spec (hardening v1.5.1, Section 2): the streak threshold
+        // *defaults* to 4 — production turns always carry the guard;
+        // tests opt into other thresholds explicitly via the builder.
+        .with_same_tool_streak_guard(4);
 
     let (events_tx, mut events_rx) = mpsc::channel::<TurnEvent>(64);
     let (perm_tx, perm_rx) = mpsc::channel::<PermissionDecision>(8);
