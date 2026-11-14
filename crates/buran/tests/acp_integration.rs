@@ -1674,3 +1674,154 @@ async fn server_path_transcript_matches_direct_append_shape() {
         .expect("integration test timed out")
         .expect("ACP connection failed");
 }
+
+/// Task 14 (hardening v1.5.1): resume + writer — a loaded session's post-
+/// resume appends land after the pre-resume records, in order, and the
+/// whole file replays (no torn or out-of-order lines across the resume
+/// boundary).
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_session_appends_after_existing_records_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    // Turn 1 (writer-written): user + assistant + usage.
+    let m = MockTransport::new();
+    let body1 = format!(
+        "data: {}\n\n{}",
+        text_chunk("alpha"),
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}}"#,
+    );
+    m.push_response_frames(sse(vec![Box::leak(
+        format!("{body1}\n\ndata: [DONE]\n\n").into_boxed_str(),
+    )]));
+    let m2 = m.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+    let stored_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored_id1 = stored_id.clone();
+    let cwd1 = cwd.clone();
+    let client1 = Client.v1().connect_with(agent, move |cx| {
+        let stored_id = stored_id1.clone();
+        let cwd = cwd1.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx.build_session(cwd).block_task().start_session().await?;
+            *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
+            session.send_prompt("first")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client1)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+    let id = stored_id.lock().unwrap().clone().expect("id captured");
+
+    // Give the writer task a beat to flush turn 1 before the second
+    // process reopens the file.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Turn 2 (fresh process, loadSession): appends must continue the file.
+    let m = MockTransport::new();
+    let body2 = format!(
+        "data: {}\n\n{}",
+        text_chunk("beta"),
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+    );
+    m.push_response_frames(sse(vec![Box::leak(
+        format!("{body2}\n\ndata: [DONE]\n\n").into_boxed_str(),
+    )]));
+    let m2 = m.clone();
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder 2");
+    let dir_path = dir.path().to_path_buf();
+    let client2 = Client.v1().connect_with(agent, move |cx| {
+        let id = id.clone();
+        let cwd = cwd.clone();
+        let dir_path = dir_path.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } = cx
+                .load_session(id.clone(), cwd)
+                .block_task()
+                .start_session()
+                .await?;
+            session.send_prompt("second")?;
+            let _ = session.read_to_string().await?;
+
+            // Poll until the resumed writer flushed turn 2's usage, then
+            // check the whole-file record order across the boundary.
+            let store = buran::store::Store::new(&dir_path);
+            let mut records = Vec::new();
+            for _ in 0..50 {
+                let (_, replayed) = store.open(&id).expect("transcript readable");
+                let usage_count = replayed
+                    .iter()
+                    .filter(|r| matches!(r, TranscriptRecord::Usage { .. }))
+                    .count();
+                if usage_count >= 2 {
+                    records = replayed;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                records.len() >= 7,
+                "head + (user, assistant, usage) x2 expected: {} records",
+                records.len()
+            );
+            let kinds: Vec<&str> = records
+                .iter()
+                .map(|r| match r {
+                    TranscriptRecord::Metadata(_) => "metadata",
+                    TranscriptRecord::Message(m) => match m.role {
+                        buran::llm::types::Role::User => "user",
+                        buran::llm::types::Role::Assistant => "assistant",
+                        _ => "other",
+                    },
+                    TranscriptRecord::Usage { .. } => "usage",
+                    TranscriptRecord::CompactionPoint { .. } => "compaction",
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    "metadata",
+                    "user",
+                    "assistant",
+                    "usage", // turn 1
+                    "user",
+                    "assistant",
+                    "usage", // turn 2, appended
+                ],
+                "resumed session must append after existing records: {kinds:?}"
+            );
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client2)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+}
