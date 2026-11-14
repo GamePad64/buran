@@ -47,6 +47,18 @@ fn metadata_record_round_trips() {
     assert_eq!(back, ended);
 }
 
+#[test]
+fn usage_record_round_trips() {
+    let record = TranscriptRecord::Usage {
+        prompt_tokens: 12,
+        completion_tokens: 7,
+        total_tokens: 19,
+    };
+    let json = serde_json::to_string(&record).unwrap();
+    let back: TranscriptRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, record);
+}
+
 fn record_meta() -> TranscriptMeta {
     TranscriptMeta {
         model: "test-model".into(),

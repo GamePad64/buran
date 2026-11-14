@@ -270,6 +270,10 @@ fn build_agent(
                                 ..
                             } => compaction_points.push(*at_message),
                             crate::session::TranscriptRecord::Metadata(_) => {}
+                            // Usage is bookkeeping, not conversation: it
+                            // must not affect the rebuilt SessionState
+                            // (Review Focus #3).
+                            crate::session::TranscriptRecord::Usage { .. } => {}
                         }
                     }
                     Ok(SessionHandle {

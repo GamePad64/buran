@@ -22,6 +22,14 @@ pub enum TranscriptRecord {
     },
     /// Session bookkeeping, written once at the head of the transcript.
     Metadata(TranscriptMeta),
+    /// Token usage observed at the end of one LLM turn (v1.5.1 hardening:
+    /// record only — no presentation yet). Unknown to pre-1.5.1 binaries,
+    /// which skip it on replay per ADR 0007.
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
 }
 
 /// Session bookkeeping: what ran, where, and when.
