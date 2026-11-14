@@ -625,6 +625,10 @@ async fn run_prompt_turn_inner(
             }
             FinishReason::Length => StopReason::MaxTokens,
             FinishReason::MaxTurnRequests => StopReason::MaxTurnRequests,
+            // LoopGuard is an internal cut, not a protocol concept: the
+            // system note in history explains the stop to the model, and
+            // the client sees an ordinary end-of-turn.
+            FinishReason::LoopGuard => StopReason::EndTurn,
         }
     };
     Ok((stop, summary.usage))

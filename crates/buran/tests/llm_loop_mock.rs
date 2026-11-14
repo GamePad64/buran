@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use buran::config::{ApiKey, ProviderConfig};
 use buran::llm::LlmClient;
 use buran::llm::loop_::{AgentLoop, PermissionDecision, SessionState, ToolCaller, TurnEvent};
-use buran::llm::types::FinishReason;
+use buran::llm::types::{FinishReason, Role};
 use buran::mcp::{McpError, ToolOutput};
 
 fn provider() -> ProviderConfig {
@@ -304,4 +304,69 @@ async fn no_usage_chunk_leaves_summary_usage_none() {
         .unwrap();
 
     assert!(summary.usage.is_none(), "no usage chunk → no usage");
+}
+
+/// The same tool with identical arguments, requested round after round, is
+/// a runaway loop: after N identical consecutive rounds the streak guard
+/// cuts the turn with `FinishReason::LoopGuard`, leaves a system note the
+/// model sees on resume, and does not execute call N+1.
+#[tokio::test]
+async fn same_tool_streak_guard_cuts_after_n_identical_rounds() {
+    let m = hclient::mock::MockTransport::new();
+    // Five identical rounds of fs__read {"path":"x"}; the guard must cut
+    // after 4 (threshold), so round 5's response is never consumed.
+    for _ in 0..5 {
+        m.push_response_frames(sse(vec![tool_call_chunks()]));
+    }
+
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let tools = Arc::new(StubCaller::default());
+    let entry = buran::mcp::ToolEntry {
+        server: "fs".into(),
+        tool: buran::mcp::McpTool::new("read", "read a file", serde_json::Map::new()),
+    };
+    let loop_ = AgentLoop::new(llm, tools.clone(), "be helpful".to_string())
+        .with_catalog(&buran::mcp::ToolCatalog::new(vec![entry]))
+        .with_same_tool_streak_guard(4);
+    let mut session = SessionState::default();
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    // Auto-allow everything so the only thing that can stop the turn is
+    // the guard.
+    let answer = tokio::spawn(async move {
+        while let Some(ev) = events_rx.recv().await {
+            if let TurnEvent::PermissionQuery(_) = &ev {
+                let _ = perm_tx.send(PermissionDecision::Allow).await;
+            }
+        }
+    });
+
+    let summary = loop_
+        .run_turn(&mut session, "read the file", events_tx, perm_rx, cancel_rx)
+        .await
+        .unwrap();
+    answer.abort();
+
+    assert_eq!(
+        summary.finish,
+        FinishReason::LoopGuard,
+        "streak guard must cut the turn"
+    );
+    assert_eq!(
+        tools.real_calls.load(Ordering::SeqCst),
+        4,
+        "the cut round's calls must not execute"
+    );
+    let last = session.history.last().expect("history not empty");
+    assert_eq!(last.role, Role::System, "cut note is a system message");
+    assert!(
+        last.content
+            .as_deref()
+            .unwrap_or("")
+            .contains("loop guard"),
+        "note must explain the cut: {last:?}"
+    );
 }

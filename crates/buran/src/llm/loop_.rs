@@ -125,6 +125,10 @@ pub struct AgentLoop {
     /// Wire name `server__tool` → MCP qualified `server/tool`.
     tool_map: BTreeMap<String, String>,
     max_turns: u32,
+    /// Same-tool streak guard (hardening v1.5.1): after this many
+    /// consecutive rounds requesting the identical tool-call set, the turn
+    /// is cut with `FinishReason::LoopGuard`. `None` disables the guard.
+    same_tool_streak_guard: Option<u32>,
     /// Scanned skill descriptions; `<skill>Name</skill>` at the head of
     /// the turn's first assistant message loads the matching body
     /// (ADR 0004 — zero tools, the model just writes the tag).
@@ -140,6 +144,7 @@ impl AgentLoop {
             tool_defs: Vec::new(),
             tool_map: BTreeMap::new(),
             max_turns: 32,
+            same_tool_streak_guard: None,
             skills: Vec::new(),
         }
     }
@@ -180,6 +185,14 @@ impl AgentLoop {
         self
     }
 
+    /// Sets the same-tool streak guard (hardening v1.5.1): after `n`
+    /// consecutive rounds with the identical tool-call request set, the
+    /// turn is cut with a system note in history.
+    pub fn with_same_tool_streak_guard(mut self, n: u32) -> Self {
+        self.same_tool_streak_guard = Some(n);
+        self
+    }
+
     /// Runs one user prompt to completion, streaming events on `events` and
     /// asking `permissions` for every tool call (decisions arrive on the
     /// paired sender; a closed channel or cancellation denies).
@@ -198,6 +211,11 @@ impl AgentLoop {
         let mut tool_calls_made: u32 = 0;
         // Last usage seen across the turn's rounds (hardening v1.5.1).
         let mut usage: Option<Usage> = None;
+        // Same-tool streak guard state: canonical signature of the last
+        // round's requested tool-call set, and how many consecutive rounds
+        // have carried it (hardening v1.5.1).
+        let mut last_signature: Option<String> = None;
+        let mut streak_count: u32 = 0;
         // `<skill>` detection applies to the turn's first assistant
         // message only (ADR 0004).
         let mut first_assistant_message = true;
@@ -267,6 +285,53 @@ impl AgentLoop {
             session
                 .history
                 .push(ChatMessage::assistant_with_tool_calls(requested.clone()));
+
+            // Streak guard (hardening v1.5.1): a canonical signature of
+            // this round's requested calls; identical consecutive rounds
+            // mean the model is stuck. The canonical form sorts by wire
+            // name so per-round ordering cannot mask an identical request.
+            let signature = {
+                let mut names: Vec<String> = requested
+                    .iter()
+                    .map(|c| c.function.name.clone())
+                    .collect();
+                names.sort();
+                let args: Vec<String> = requested
+                    .iter()
+                    .map(|c| canonical_args(&c.function.arguments))
+                    .collect();
+                format!("{names:?} {args:?}")
+            };
+            if Some(&signature) == last_signature.as_ref() {
+                streak_count += 1;
+            } else {
+                last_signature = Some(signature);
+                streak_count = 1;
+            }
+            if let Some(limit) = self.same_tool_streak_guard {
+                if streak_count > limit {
+                    // Cut: `limit` identical rounds were allowed to run;
+                    // this request is the (limit+1)-th, and executing it
+                    // would only repeat the loop. A system note explains
+                    // the cut so the model sees why its tool call never
+                    // ran (and the client's next prompt continues from an
+                    // explained stop).
+                    let note = format!(
+                        "The loop guard stopped this turn: the same tool \
+                         call has been requested {streak_count} times in a \
+                         row with identical arguments. If you have already \
+                         completed the task, summarize the result; \
+                         otherwise change your approach."
+                    );
+                    session.history.push(ChatMessage::system(note));
+                    let _ = events.send(TurnEvent::TurnDone(FinishReason::LoopGuard)).await;
+                    return Ok(TurnSummary {
+                        finish: FinishReason::LoopGuard,
+                        tool_calls_made,
+                        usage,
+                    });
+                }
+            }
 
             for call in &requested {
                 let _ = events
@@ -459,6 +524,15 @@ impl AgentLoop {
 fn pretty_arguments(arguments: &str) -> String {
     serde_json::from_str::<serde_json::Value>(arguments)
         .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
+        .unwrap_or_else(|_| arguments.to_string())
+}
+
+/// Canonicalizes a tool-call argument string for streak comparison:
+/// re-serialized JSON so key order and whitespace cannot mask (or fake) an
+/// identical request. Unparseable arguments compare as their raw string.
+fn canonical_args(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .map(|value| serde_json::to_string(&value).unwrap_or_default())
         .unwrap_or_else(|_| arguments.to_string())
 }
 

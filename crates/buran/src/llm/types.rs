@@ -164,6 +164,10 @@ pub enum FinishReason {
     /// parsed from the wire — an API never sends this name; run_turn
     /// synthesizes it so callers see a cut loop, not a clean end.
     MaxTurnRequests,
+    /// Loop-internal: the same-tool streak guard cut the turn (hardening
+    /// v1.5.1) — the model requested the same tool call round after round.
+    /// Never parsed from the wire.
+    LoopGuard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
