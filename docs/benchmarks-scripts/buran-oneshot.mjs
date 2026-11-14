@@ -1,5 +1,6 @@
 // One-shot: spawn buran serve, drive ACP prompt, measure wall time + RSS peak
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 const t0 = Date.now();
 const p = spawn('/mnt/devenv/workspace/buran/target/release/buran', ['serve'], { stdio: ['pipe','pipe','inherit'] });
 let buf = '', id = 0, sessionId;
@@ -22,9 +23,12 @@ await rpc('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTe
 const s = await rpc('session/new', { cwd: '/tmp', mcpServers: [] });
 sessionId = s.sessionId;
 const t1 = Date.now();
+let rssPeak = 0;
+const poller = setInterval(() => {
+  try { rssPeak = Math.max(rssPeak, parseInt(fs.readFileSync(`/proc/${p.pid}/status`,'utf8').match(/VmRSS:\s+(\d+)/)[1])); } catch {}
+}, 30);
 const stop = await rpc('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'Reply with exactly one word: ping' }] });
 const t2 = Date.now();
-let rss = '?';
-try { rss = require('fs').readFileSync(`/proc/${p.pid}/status`,'utf8').match(/VmRSS:\s+(\d+)/)[1]; } catch {}
-console.log(JSON.stringify({ handshake_ms: t1-t0, prompt_ms: t2-t1, total_ms: t2-t0, serve_rss_mb: (rss/1024).toFixed(1) }));
+clearInterval(poller);
+console.log(JSON.stringify({ handshake_ms: t1-t0, prompt_ms: t2-t1, total_ms: t2-t0, serve_rss_peak_mb: (rssPeak/1024).toFixed(1) }));
 p.kill(); process.exit(0);

@@ -18,3 +18,13 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
+
+# Binary-size budget (ADR 0008): fat LTO + one codegen unit + strip keeps
+# buran at ~9 MB stripped (11.1 MB unstripped, 8.8 MB pre-LTO); budgets
+# are ≤ 15 MB binary / ≤ 10 MB session RSS / ≤ 100 ms cold start.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+
