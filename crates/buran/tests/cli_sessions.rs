@@ -21,6 +21,42 @@ fn run_buran_with_home(home: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Seeds a session whose first user message is a title, plus a second,
+/// older session so list order is observable. Returns the NEWER id.
+fn seed_two_sessions(home: &std::path::Path) -> (&'static str, &'static str) {
+    let store_root = home.join(".local/state/buran/sessions");
+    std::fs::create_dir_all(&store_root).unwrap();
+    let write = |id: &str, cwd: &str, ask: &str| {
+        std::fs::write(
+            store_root.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "metadata", "model": "seed-model", "provider": "seed-provider",
+                    "started_at": "2026-11-12T00:00:00Z", "ended_at": null, "cwd": cwd
+                }),
+                serde_json::json!({"type": "message", "role": "user", "content": ask}),
+            ),
+        )
+        .unwrap();
+    };
+    // UUIDv7: the larger stem is the newer session.
+    write(
+        "01940000-0000-7000-8000-000000000001",
+        "/old",
+        "older question",
+    );
+    write(
+        "01940000-0000-7000-8000-000000000002",
+        "/new",
+        "newer question",
+    );
+    (
+        "01940000-0000-7000-8000-000000000002",
+        "01940000-0000-7000-8000-000000000001",
+    )
+}
+
 fn seed_session(home: &std::path::Path) -> &'static str {
     let store_root = home.join(".local/state/buran/sessions");
     std::fs::create_dir_all(&store_root).unwrap();
@@ -55,6 +91,24 @@ fn sessions_list_and_rm_roundtrip_through_the_real_binary() {
     run_buran_with_home(home.path(), &["sessions", "rm", id]);
     let out = run_buran_with_home(home.path(), &["sessions", "list"]);
     assert!(!out.contains(id), "session gone after rm: {out}");
+}
+
+#[test]
+fn sessions_list_shows_titles_newest_first() {
+    let home = tempfile::tempdir().unwrap();
+    let (newer, older) = seed_two_sessions(home.path());
+    let out = run_buran_with_home(home.path(), &["sessions", "list"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].starts_with(newer) && lines[0].contains("newer question"),
+        "newest session first, carrying its title: {out}"
+    );
+    assert!(
+        lines[1].starts_with(older) && lines[1].contains("older question"),
+        "older session second: {out}"
+    );
+    assert!(lines[0].contains("/new"), "cwd stays visible: {out}");
 }
 
 #[test]

@@ -86,12 +86,17 @@ pub fn sessions_list() -> Result<()> {
         println!("no stored sessions");
         return Ok(());
     }
-    for i in infos {
+    // Newest first: switching is "back to the recent one", and uuidv7
+    // order is chronological, so reversing the catalog listing is the
+    // whole sort. `(empty)` marks a session with no user message yet —
+    // a blank title column would look like a formatting bug.
+    for i in infos.iter().rev() {
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             i.id,
             i.meta.started_at,
-            i.meta.model,
+            i.title.as_deref().unwrap_or("(empty)"),
+            i.meta.cwd.display(),
             i.meta.forked_from.as_deref().unwrap_or("-")
         );
     }
