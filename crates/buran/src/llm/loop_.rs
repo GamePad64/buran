@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, watch};
 use super::client::{ChatEvent, LlmClient};
 use super::types::{
     ChatMessage, ChatRequest, FinishReason, FunctionCall, FunctionType, ToolCallReq, ToolDef,
-    ToolDefFn,
+    ToolDefFn, Usage,
 };
 use crate::mcp::{McpError, ToolOutput};
 
@@ -97,6 +97,10 @@ pub struct SessionState {
 pub struct TurnSummary {
     pub finish: FinishReason,
     pub tool_calls_made: u32,
+    /// Usage observed on the turn's final chunk, if the endpoint sent any
+    /// (hardening v1.5.1). The server layer turns this into a
+    /// `TranscriptRecord::Usage`; the loop itself stays I/O-free (ADR 0001).
+    pub usage: Option<Usage>,
 }
 
 /// Resolves once cancellation is requested; parks forever if the sender is
@@ -192,6 +196,8 @@ impl AgentLoop {
         session.history.push(ChatMessage::user(user_text));
 
         let mut tool_calls_made: u32 = 0;
+        // Last usage seen across the turn's rounds (hardening v1.5.1).
+        let mut usage: Option<Usage> = None;
         // `<skill>` detection applies to the turn's first assistant
         // message only (ADR 0004).
         let mut first_assistant_message = true;
@@ -201,6 +207,7 @@ impl AgentLoop {
                 return Ok(TurnSummary {
                     finish: FinishReason::Stop,
                     tool_calls_made,
+                    usage,
                 });
             }
 
@@ -215,8 +222,11 @@ impl AgentLoop {
                 req
             };
 
-            let (assistant_text, requested, round_finish) =
+            let (assistant_text, requested, round_finish, round_usage) =
                 self.stream_round(&req, &events, &mut cancel).await?;
+            if round_usage.is_some() {
+                usage = round_usage;
+            }
 
             if *cancel.borrow_and_update() {
                 // Cancel fired mid-stream: keep any partial text, stop clean.
@@ -226,6 +236,7 @@ impl AgentLoop {
                 return Ok(TurnSummary {
                     finish: FinishReason::Stop,
                     tool_calls_made,
+                    usage,
                 });
             }
 
@@ -248,6 +259,7 @@ impl AgentLoop {
                 return Ok(TurnSummary {
                     finish,
                     tool_calls_made,
+                    usage,
                 });
             }
 
@@ -318,6 +330,7 @@ impl AgentLoop {
         Ok(TurnSummary {
             finish: FinishReason::MaxTurnRequests,
             tool_calls_made,
+            usage,
         })
     }
 
@@ -346,13 +359,15 @@ impl AgentLoop {
 
     /// Streams one LLM round: text deltas out as events, tool-call fragments
     /// accumulated by index. Returns the accumulated text, the completed
-    /// tool-call requests, and the round's finish reason if one arrived.
+    /// tool-call requests, the round's finish reason if one arrived, and the
+    /// usage the round observed (hardening v1.5.1).
     async fn stream_round(
         &self,
         req: &ChatRequest,
         events: &mpsc::Sender<TurnEvent>,
         cancel: &mut watch::Receiver<bool>,
-    ) -> Result<(String, Vec<ToolCallReq>, Option<FinishReason>), super::LlmError> {
+    ) -> Result<(String, Vec<ToolCallReq>, Option<FinishReason>, Option<Usage>), super::LlmError>
+    {
         let mut stream = self.llm.stream_chat(req).await?;
 
         let mut text = String::new();
@@ -364,7 +379,7 @@ impl AgentLoop {
         loop {
             tokio::select! {
                 _ = wait_for_cancel(cancel) => {
-                    return Ok((text, Vec::new(), finish_seen));
+                    return Ok((text, Vec::new(), finish_seen, stream.last_usage()));
                 }
                 event = stream.next() => {
                     match event? {
@@ -406,7 +421,7 @@ impl AgentLoop {
             })
             .collect();
 
-        Ok((text, requested, finish_seen))
+        Ok((text, requested, finish_seen, stream.last_usage()))
     }
 
     /// Asks for permission to run `call`. The query rides the events

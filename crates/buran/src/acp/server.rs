@@ -459,9 +459,23 @@ async fn run_prompt_turn(
                     }
                 }
             }
+            // Usage record (hardening v1.5.1): one line per completed turn,
+            // after the turn's messages so the transcript reads in order.
+            // Degrades like the message appends above.
+            if let (Some(file), Ok((_, Some(usage)))) =
+                (handle.store_file.as_mut(), result.as_ref())
+            {
+                if let Err(e) = file.append(&crate::session::TranscriptRecord::Usage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                }) {
+                    tracing::error!(%e, "usage append failed — continuing without persistence");
+                }
+            }
         }
     }
-    result.map_err(PromptError::MidTurn)
+    result.map_err(PromptError::MidTurn).map(|(stop, _)| stop)
 }
 
 /// Everything a turn body needs from its session, taken under the sessions
@@ -482,7 +496,7 @@ async fn run_prompt_turn_inner(
     req: &PromptRequest,
     conn: &ConnectionTo<AcpClient>,
     turn: TurnContext,
-) -> anyhow::Result<StopReason> {
+) -> anyhow::Result<(StopReason, Option<crate::llm::types::Usage>)> {
     let TurnContext {
         text,
         mut session,
@@ -602,7 +616,7 @@ async fn run_prompt_turn_inner(
     // A requested cancel wins over the loop's finish reason: the protocol
     // REQUIRES Cancelled after session/cancel.
     let cancelled = *cancel_rx.borrow_and_update();
-    Ok(if cancelled {
+    let stop = if cancelled {
         StopReason::Cancelled
     } else {
         match summary.finish {
@@ -612,7 +626,8 @@ async fn run_prompt_turn_inner(
             FinishReason::Length => StopReason::MaxTokens,
             FinishReason::MaxTurnRequests => StopReason::MaxTurnRequests,
         }
-    })
+    };
+    Ok((stop, summary.usage))
 }
 
 /// Monotonic message id for one turn's text chunks: all chunks of one

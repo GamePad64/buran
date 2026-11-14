@@ -245,3 +245,63 @@ async fn cancel_stops_turn_gracefully() {
         "cancel maps to a clean Stop"
     );
 }
+
+/// Usage arriving on the final chunk must surface in the turn summary
+/// (hardening v1.5.1: the server appends `TranscriptRecord::Usage` from it).
+#[tokio::test]
+async fn usage_on_final_chunk_reaches_turn_summary() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response_frames(sse(vec![Box::leak(
+        concat!(
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string()
+        .into_boxed_str(),
+    )]));
+
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let loop_ = AgentLoop::new(llm, Arc::new(StubCaller::default()), "be helpful".to_string());
+    let mut session = SessionState::default();
+
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+    let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    drop(events_rx);
+
+    let summary = loop_
+        .run_turn(&mut session, "hi", events_tx, perm_rx, cancel_rx)
+        .await
+        .unwrap();
+
+    let usage = summary.usage.expect("usage must reach the summary");
+    assert_eq!(usage.prompt_tokens, 11);
+    assert_eq!(usage.completion_tokens, 4);
+    assert_eq!(usage.total_tokens, 15);
+}
+
+/// No usage chunk → summary usage stays None (nothing recorded).
+#[tokio::test]
+async fn no_usage_chunk_leaves_summary_usage_none() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response_frames(sse(vec![stop_chunk("plain")]));
+
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let loop_ = AgentLoop::new(llm, Arc::new(StubCaller::default()), "be helpful".to_string());
+    let mut session = SessionState::default();
+
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+    let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    drop(events_rx);
+
+    let summary = loop_
+        .run_turn(&mut session, "hi", events_tx, perm_rx, cancel_rx)
+        .await
+        .unwrap();
+
+    assert!(summary.usage.is_none(), "no usage chunk → no usage");
+}

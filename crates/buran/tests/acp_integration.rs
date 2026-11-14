@@ -1203,3 +1203,166 @@ async fn load_session_unknown_id_errors_and_cwd_mismatch_names_both_paths() {
         .expect("timed out")
         .expect("conn failed");
 }
+
+/// Usage on the final chunk is appended as a `TranscriptRecord::Usage` line
+/// after the turn's messages (hardening v1.5.1, Review Focus #3: a resumed
+/// session with a usage line must replay fine — covered by the replay test).
+#[tokio::test(flavor = "current_thread")]
+async fn usage_chunk_is_persisted_as_usage_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    let body = format!(
+        "data: {}\n\n{}",
+        text_chunk("Hello"),
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
+    );
+    m.push_response_frames(sse(vec![Box::leak(format!(
+        "{body}\n\ndata: [DONE]\n\n"
+    ).into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let dir_path = dir.path().to_path_buf();
+    let client = Client.v1().connect_with(agent, async move |cx| {
+        initialize(&cx).await?;
+        let SessionSetup {
+            mut session,
+            response,
+            ..
+        } = cx.build_session_cwd()?.block_task().start_session().await?;
+        session.send_prompt("hi")?;
+        let _ = session.read_to_string().await?;
+
+        let id = response.session_id.0.to_string();
+        let (_, records) = buran::store::Store::new(&dir_path)
+            .open(&id)
+            .expect("transcript exists");
+        let usage = records.iter().find_map(|r| match r {
+            TranscriptRecord::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => Some((*prompt_tokens, *completion_tokens, *total_tokens)),
+            _ => None,
+        });
+        assert_eq!(
+            usage,
+            Some((5, 3, 8)),
+            "usage record must be persisted: {records:?}"
+        );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}
+
+/// A transcript containing a usage line replays cleanly: the usage record
+/// is ignored by the message-replay path (Review Focus #3).
+#[tokio::test(flavor = "current_thread")]
+async fn transcript_with_usage_record_resumes_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    // Process 1: a turn that carries usage.
+    let m = MockTransport::new();
+    let body = format!(
+        "data: {}\n\n{}",
+        text_chunk("the magic word is FROB"),
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#,
+    );
+    m.push_response_frames(sse(vec![Box::leak(format!(
+        "{body}\n\ndata: [DONE]\n\n"
+    ).into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let stored_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored_id1 = stored_id.clone();
+    let cwd1 = cwd.clone();
+    let client1 = Client.v1().connect_with(agent, move |cx| {
+        let stored_id = stored_id1.clone();
+        let cwd = cwd1.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup {
+                mut session,
+                response,
+                ..
+            } = cx
+                .build_session(cwd.clone())
+                .block_task()
+                .start_session()
+                .await?;
+            *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
+            session.send_prompt("say the magic word")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client1)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+    let id = stored_id.lock().unwrap().clone().expect("id captured");
+
+    // Process 2: resume must succeed with the usage line in the file.
+    let m = MockTransport::new();
+    let turn2 = format!("data: {}\n\n{}", text_chunk("FROB"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder 2");
+
+    let client2 = Client.v1().connect_with(agent, move |cx| {
+        let id = id.clone();
+        let cwd = cwd.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, .. } = cx
+                .load_session(id, cwd)
+                .block_task()
+                .start_session()
+                .await?;
+            session.send_prompt("what was the magic word?")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client2)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+}
