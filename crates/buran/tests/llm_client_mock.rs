@@ -364,3 +364,19 @@ async fn non_retryable_400_is_not_retried() {
     );
     assert_eq!(m.requests().len(), 1, "no retry on 400");
 }
+
+/// Production construction path (hardening v1.5.1 Task 6): `LlmClient::new`
+/// builds `default_transport()` with the retry policy and tokio clock
+/// attached. No network is touched at construction; this only proves the
+/// real builder path resolves (trust store, transport, retry, clock) on
+/// this machine — `serve()` calls exactly this through its factory.
+#[test]
+fn production_new_builds_client_with_retry_policy() {
+    let provider = ProviderConfig {
+        name: "prod".into(),
+        base_url: "https://api.example.com/v1".into(),
+        model: "m".into(),
+        api_key: ApiKey::Explicit("sk-x".into()),
+    };
+    let _client = LlmClient::new(&provider).expect("production client must construct");
+}
