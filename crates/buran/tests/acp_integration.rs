@@ -1113,7 +1113,7 @@ async fn load_session_replays_history_and_continues_the_conversation() {
     let requests = m2.requests();
     assert!(!requests.is_empty());
     assert!(
-        body_contains(&requests.last().unwrap(), "the magic word is FROB"),
+        body_contains(requests.last().unwrap(), "the magic word is FROB"),
         "resumed conversation's LLM request must contain pre-restart history"
     );
 }
@@ -1175,12 +1175,13 @@ async fn load_session_unknown_id_errors_and_cwd_mismatch_names_both_paths() {
                 "{err}"
             );
 
-            // Real id, wrong cwd: the error must name both paths.
+            // Real id, wrong cwd: the error must name both paths. The id
+            // is cloned out of the guard BEFORE the await (a std
+            // MutexGuard held across an await point is a clippy lint and,
+            // under a multi-thread runtime, a real deadlock risk).
+            let stored = stored_id.lock().unwrap().clone().unwrap();
             let wrong = cx
-                .load_session(
-                    stored_id.lock().unwrap().clone().unwrap(),
-                    std::path::PathBuf::from("/some/other/cwd"),
-                )
+                .load_session(stored, std::path::PathBuf::from("/some/other/cwd"))
                 .block_task()
                 .start_session()
                 .await;
