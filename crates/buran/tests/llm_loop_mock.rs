@@ -264,7 +264,11 @@ async fn usage_on_final_chunk_reaches_turn_summary() {
     )]));
 
     let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
-    let loop_ = AgentLoop::new(llm, Arc::new(StubCaller::default()), "be helpful".to_string());
+    let loop_ = AgentLoop::new(
+        llm,
+        Arc::new(StubCaller::default()),
+        "be helpful".to_string(),
+    );
     let mut session = SessionState::default();
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
@@ -290,7 +294,11 @@ async fn no_usage_chunk_leaves_summary_usage_none() {
     m.push_response_frames(sse(vec![stop_chunk("plain")]));
 
     let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
-    let loop_ = AgentLoop::new(llm, Arc::new(StubCaller::default()), "be helpful".to_string());
+    let loop_ = AgentLoop::new(
+        llm,
+        Arc::new(StubCaller::default()),
+        "be helpful".to_string(),
+    );
     let mut session = SessionState::default();
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
@@ -363,10 +371,53 @@ async fn same_tool_streak_guard_cuts_after_n_identical_rounds() {
     let last = session.history.last().expect("history not empty");
     assert_eq!(last.role, Role::System, "cut note is a system message");
     assert!(
-        last.content
-            .as_deref()
-            .unwrap_or("")
-            .contains("loop guard"),
+        last.content.as_deref().unwrap_or("").contains("loop guard"),
         "note must explain the cut: {last:?}"
+    );
+}
+
+/// The threshold is the builder's argument: guard(2) cuts on the request
+/// that would be the 3rd identical round — two run, the third never does.
+#[tokio::test]
+async fn streak_guard_threshold_is_configurable() {
+    let m = hclient::mock::MockTransport::new();
+    for _ in 0..4 {
+        m.push_response_frames(sse(vec![tool_call_chunks()]));
+    }
+
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let tools = Arc::new(StubCaller::default());
+    let entry = buran::mcp::ToolEntry {
+        server: "fs".into(),
+        tool: buran::mcp::McpTool::new("read", "read a file", serde_json::Map::new()),
+    };
+    let loop_ = AgentLoop::new(llm, tools.clone(), "be helpful".to_string())
+        .with_catalog(&buran::mcp::ToolCatalog::new(vec![entry]))
+        .with_same_tool_streak_guard(2);
+    let mut session = SessionState::default();
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    let answer = tokio::spawn(async move {
+        while let Some(ev) = events_rx.recv().await {
+            if let TurnEvent::PermissionQuery(_) = &ev {
+                let _ = perm_tx.send(PermissionDecision::Allow).await;
+            }
+        }
+    });
+
+    let summary = loop_
+        .run_turn(&mut session, "read the file", events_tx, perm_rx, cancel_rx)
+        .await
+        .unwrap();
+    answer.abort();
+
+    assert_eq!(summary.finish, FinishReason::LoopGuard);
+    assert_eq!(
+        tools.real_calls.load(Ordering::SeqCst),
+        2,
+        "guard(2) allows exactly two identical rounds"
     );
 }
