@@ -1493,3 +1493,85 @@ async fn set_mode_overrides_policy_per_session() {
         "denial tool result must be in the continuation request"
     );
 }
+
+/// loadSession advertises the same three policy modes as newSession
+/// (hardening v1.5.1): a resumed session's client sees the mode list too.
+#[tokio::test(flavor = "current_thread")]
+async fn load_session_advertises_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+
+    // Session 1: create + one turn, store the id.
+    let m = MockTransport::new();
+    let turn1 = format!("data: {}\n\n{}", text_chunk("x"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+    let stored_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored_id1 = stored_id.clone();
+    let cwd1 = cwd.clone();
+    let client1 = Client.v1().connect_with(agent, move |cx| {
+        let stored_id = stored_id1.clone();
+        let cwd = cwd1.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup { session, response, .. } =
+                cx.build_session(cwd).block_task().start_session().await?;
+            *stored_id.lock().unwrap() = Some(response.session_id.0.to_string());
+            let mut session = session;
+            session.send_prompt("hi")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client1)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+    let id = stored_id.lock().unwrap().clone().unwrap();
+
+    // Session 2 (fresh agent, same store): loadSession must carry modes.
+    let m = MockTransport::new();
+    let turn2 = format!("data: {}\n\n{}", text_chunk("y"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let mut config = test_config(Vec::new());
+    config.sessions_dir = Some(dir.path().to_path_buf());
+    let agent = buran::acp::agent_builder_with_config(config, move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder 2");
+    let cwd2 = cwd.clone();
+    let client2 = Client.v1().connect_with(agent, move |cx| {
+        let id = id.clone();
+        let cwd = cwd2.clone();
+        async move {
+            initialize(&cx).await?;
+            let SessionSetup { mut session, response, .. } =
+                cx.load_session(id, cwd).block_task().start_session().await?;
+            let modes = response
+                .modes
+                .expect("loadSession must advertise the policy modes");
+            assert_eq!(modes.available_modes.len(), 3);
+            assert_eq!(modes.current_mode_id.0.as_ref(), "ask");
+            session.send_prompt("more")?;
+            let _ = session.read_to_string().await?;
+            Ok(())
+        }
+    });
+    tokio::time::timeout(TIMEOUT, client2)
+        .await
+        .expect("timed out")
+        .expect("conn failed");
+}
