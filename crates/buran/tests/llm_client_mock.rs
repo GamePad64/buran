@@ -214,3 +214,153 @@ async fn mixed_content_and_tool_calls_in_one_chunk_survive() {
         )))
     );
 }
+
+/// Retry wiring (hardening v1.5.1): a 429 followed by a success on the
+/// same request means one retried attempt, resolved without surfacing the
+/// 429. `TestTimer` stands in for the wall clock, so the backoff sleep is
+/// observed rather than waited.
+#[tokio::test]
+async fn retriable_429_is_retried_to_success() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response(
+        http::Response::builder()
+            .status(429)
+            .header("content-type", "application/json")
+            .body(r#"{"error":{"message":"slow down"}}"#)
+            .unwrap(),
+    );
+    m.push_response_frames(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(sse_body())
+            .unwrap(),
+    );
+    let timer = hclient::mock::TestTimer::new();
+    let llm = LlmClient::with_transport(
+        provider(),
+        hclient::Client::builder(m.clone())
+            .retry(timer.clone(), hclient::retry::Standard::transient())
+            .build()
+            .unwrap(),
+    );
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+    let mut text = String::new();
+    while let Some(ev) = s.next().await.unwrap() {
+        if let ChatEvent::Delta(t) = ev {
+            text.push_str(&t);
+        }
+    }
+    assert_eq!(text, "Hello");
+    assert_eq!(m.requests().len(), 2, "exactly one retry");
+    assert!(
+        !timer.sleeps().is_empty(),
+        "backoff sleep observed via TestTimer"
+    );
+}
+
+/// A `Retry-After` header tells the client how long to wait: the recorded
+/// sleep must match it (TestTimer resolves instantly but records).
+#[tokio::test]
+async fn retry_after_header_is_honored_by_timer() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response(
+        http::Response::builder()
+            .status(429)
+            .header("retry-after", "2")
+            .header("content-type", "application/json")
+            .body("{}")
+            .unwrap(),
+    );
+    m.push_response_frames(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(sse_body())
+            .unwrap(),
+    );
+    let timer = hclient::mock::TestTimer::new();
+    let llm = LlmClient::with_transport(
+        provider(),
+        hclient::Client::builder(m.clone())
+            .retry(timer.clone(), hclient::retry::Standard::transient())
+            .build()
+            .unwrap(),
+    );
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+    while let Some(ev) = s.next().await.unwrap() {
+        let _ = ev;
+    }
+    assert_eq!(m.requests().len(), 2);
+    let sleeps = timer.sleeps();
+    assert!(
+        sleeps.contains(&std::time::Duration::from_secs(2)),
+        "sleep of Retry-After=2s must be recorded: {sleeps:?}"
+    );
+}
+
+/// Every attempt exhausted → the terminal error surfaces (the last
+/// response's error), not a silent success.
+#[tokio::test]
+async fn exhausted_attempts_return_terminal_error() {
+    let m = hclient::mock::MockTransport::new();
+    // Push enough 429s to outlast any policy under test.
+    for _ in 0..6 {
+        m.push_response(
+            http::Response::builder()
+                .status(429)
+                .header("content-type", "application/json")
+                .body("{}")
+                .unwrap(),
+        );
+    }
+    let timer = hclient::mock::TestTimer::new();
+    let llm = LlmClient::with_transport(
+        provider(),
+        hclient::Client::builder(m.clone())
+            .retry(timer.clone(), hclient::retry::Standard::transient())
+            .build()
+            .unwrap(),
+    );
+    let req = ChatRequest::new("test-model", vec![]);
+    let err = llm.stream_chat(&req).await.unwrap_err();
+    assert!(
+        matches!(err, buran::llm::LlmError::Api { .. }),
+        "terminal error must surface: {err}"
+    );
+    assert!(
+        m.requests().len() >= 3,
+        "several attempts made before giving up: {}",
+        m.requests().len()
+    );
+}
+
+/// 400 is not transient: no retry, single request.
+#[tokio::test]
+async fn non_retryable_400_is_not_retried() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response(
+        http::Response::builder()
+            .status(400)
+            .header("content-type", "application/json")
+            .body(r#"{"error":{"message":"bad request"}}"#)
+            .unwrap(),
+    );
+    let timer = hclient::mock::TestTimer::new();
+    let llm = LlmClient::with_transport(
+        provider(),
+        hclient::Client::builder(m.clone())
+            .retry(timer.clone(), hclient::retry::Standard::transient())
+            .build()
+            .unwrap(),
+    );
+    let req = ChatRequest::new("test-model", vec![]);
+    let err = llm.stream_chat(&req).await.unwrap_err();
+    assert!(
+        matches!(err, buran::llm::LlmError::Api { status: 400, .. }),
+        "{err}"
+    );
+    assert_eq!(m.requests().len(), 1, "no retry on 400");
+}

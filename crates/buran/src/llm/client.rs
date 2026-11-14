@@ -148,9 +148,32 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// Builds a client for the provider, resolving its API key.
+    ///
+    /// The client carries the retry policy (hardening v1.5.1): transient
+    /// statuses (408/429/5xx minus 501/505) retried with exponential
+    /// backoff, `Retry-After` honored up to 30s, four attempts. The timer
+    /// is hclient's default (tokio) clock, so sleeps need the ambient
+    /// runtime — the same one `send()` already requires.
     pub fn new(provider: &ProviderConfig) -> Result<Self, LlmError> {
+        let policy = hclient::retry::Standard {
+            statuses: hclient::retry::RetryStatuses::Transient,
+            backoff: hclient::retry::Backoff {
+                base: std::time::Duration::from_millis(500),
+                max: std::time::Duration::from_secs(30),
+                max_attempts: Some(4),
+            },
+            max_retry_after: std::time::Duration::from_secs(30),
+            ..hclient::retry::Standard::default()
+        };
+        // The clock: `DefaultClock` is a type alias for the tokio clock's
+        // unit struct, so `::default()` names it as a value — the same
+        // clock the builder would install if `retry` were never called.
+        let client = hclient::Client::builder(hclient::default_transport()?)
+            .retry(hclient::DefaultClock::default(), policy)
+            .build()
+            .map_err(|e| LlmError::Http(hclient::Error::new(hclient::ErrorKind::Unsupported, e)))?;
         Ok(Self {
-            client: hclient::Client::new()?,
+            client,
             provider: provider.clone(),
         })
     }

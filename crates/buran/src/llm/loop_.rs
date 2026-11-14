@@ -291,10 +291,8 @@ impl AgentLoop {
             // mean the model is stuck. The canonical form sorts by wire
             // name so per-round ordering cannot mask an identical request.
             let signature = {
-                let mut names: Vec<String> = requested
-                    .iter()
-                    .map(|c| c.function.name.clone())
-                    .collect();
+                let mut names: Vec<String> =
+                    requested.iter().map(|c| c.function.name.clone()).collect();
                 names.sort();
                 let args: Vec<String> = requested
                     .iter()
@@ -308,29 +306,30 @@ impl AgentLoop {
                 last_signature = Some(signature);
                 streak_count = 1;
             }
-            if let Some(limit) = self.same_tool_streak_guard {
-                if streak_count > limit {
-                    // Cut: `limit` identical rounds were allowed to run;
-                    // this request is the (limit+1)-th, and executing it
-                    // would only repeat the loop. A system note explains
-                    // the cut so the model sees why its tool call never
-                    // ran (and the client's next prompt continues from an
-                    // explained stop).
-                    let note = format!(
-                        "The loop guard stopped this turn: the same tool \
-                         call has been requested {streak_count} times in a \
-                         row with identical arguments. If you have already \
-                         completed the task, summarize the result; \
-                         otherwise change your approach."
-                    );
-                    session.history.push(ChatMessage::system(note));
-                    let _ = events.send(TurnEvent::TurnDone(FinishReason::LoopGuard)).await;
-                    return Ok(TurnSummary {
-                        finish: FinishReason::LoopGuard,
-                        tool_calls_made,
-                        usage,
-                    });
-                }
+            if let Some(limit) = self.same_tool_streak_guard
+                && streak_count > limit
+            {
+                // Cut: `limit` identical rounds were allowed to run; this
+                // request is the (limit+1)-th, and executing it would only
+                // repeat the loop. A system note explains the cut so the
+                // model sees why its tool call never ran (and the client's
+                // next prompt continues from an explained stop).
+                let note = format!(
+                    "The loop guard stopped this turn: the same tool \
+                     call has been requested {streak_count} times in a \
+                     row with identical arguments. If you have already \
+                     completed the task, summarize the result; \
+                     otherwise change your approach."
+                );
+                session.history.push(ChatMessage::system(note));
+                let _ = events
+                    .send(TurnEvent::TurnDone(FinishReason::LoopGuard))
+                    .await;
+                return Ok(TurnSummary {
+                    finish: FinishReason::LoopGuard,
+                    tool_calls_made,
+                    usage,
+                });
             }
 
             for call in &requested {
@@ -431,8 +430,15 @@ impl AgentLoop {
         req: &ChatRequest,
         events: &mpsc::Sender<TurnEvent>,
         cancel: &mut watch::Receiver<bool>,
-    ) -> Result<(String, Vec<ToolCallReq>, Option<FinishReason>, Option<Usage>), super::LlmError>
-    {
+    ) -> Result<
+        (
+            String,
+            Vec<ToolCallReq>,
+            Option<FinishReason>,
+            Option<Usage>,
+        ),
+        super::LlmError,
+    > {
         let mut stream = self.llm.stream_chat(req).await?;
 
         let mut text = String::new();

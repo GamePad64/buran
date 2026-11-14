@@ -464,14 +464,13 @@ async fn run_prompt_turn(
             // Degrades like the message appends above.
             if let (Some(file), Ok((_, Some(usage)))) =
                 (handle.store_file.as_mut(), result.as_ref())
-            {
-                if let Err(e) = file.append(&crate::session::TranscriptRecord::Usage {
+                && let Err(e) = file.append(&crate::session::TranscriptRecord::Usage {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
-                }) {
-                    tracing::error!(%e, "usage append failed — continuing without persistence");
-                }
+                })
+            {
+                tracing::error!(%e, "usage append failed — continuing without persistence");
             }
         }
     }
