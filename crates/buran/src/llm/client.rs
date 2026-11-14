@@ -22,6 +22,11 @@ pub enum LlmError {
     Http(#[from] hclient::Error),
     #[error("failed to parse API response: {0}")]
     Json(#[from] serde_json::Error),
+    /// The SSE body ended (clean EOF) mid-turn: tool-call fragments had
+    /// arrived but neither a `finish_reason` nor `[DONE]` did — the last
+    /// call is truncated and must not be executed (review Important #4).
+    #[error("stream truncated mid-tool-call: connection closed without [DONE] or finish_reason")]
+    Truncated,
 }
 
 /// Events yielded by a [`ChatStream`].
@@ -49,6 +54,11 @@ pub struct ChatStream {
     /// Last observed `usage` chunk (hardening v1.5.1): OpenAI-compatible
     /// endpoints send it on the final chunk; "last wins" across chunks.
     last_usage: Option<Usage>,
+    /// Any tool-call fragment seen this stream (review Important #4): an
+    /// EOF after this with no `finish_reason` means the call was cut
+    /// mid-accumulation — the stream ends in [`LlmError::Truncated`]
+    /// instead of a synthetic `Done`.
+    saw_tool_call: bool,
     done: bool,
     /// Tool-call deltas parsed from a chunk but not yet yielded: `next()`
     /// returns one event per call, and one chunk may carry several.
@@ -64,8 +74,10 @@ impl ChatStream {
     }
 
     /// Next event, or `None` once the stream has finished (`[DONE]` seen,
-    /// or the connection closed). [`ChatEvent::Done`] is delivered exactly
-    /// once; every call after it returns `None`.
+    /// or the connection closed after a semantically complete turn — a
+    /// close mid-tool-call is `Err(LlmError::Truncated)` instead).
+    /// [`ChatEvent::Done`] is delivered exactly once; every call after it
+    /// returns `None`.
     pub async fn next(&mut self) -> Result<Option<ChatEvent>, LlmError> {
         if let Some(event) = self.pending.pop_front() {
             return Ok(Some(event));
@@ -76,11 +88,18 @@ impl ChatStream {
         loop {
             let event = match self.sse.next().await {
                 None => {
-                    // Connection closed without [DONE]. The loop still has
-                    // whatever fragments it accumulated; surface a Done with
-                    // the last finish reason (a truncated turn is surfaced by
-                    // the missing [DONE] in logs, and Stop without a final
-                    // chunk is the graceful reading).
+                    // Connection closed without [DONE]. Two readings: if any
+                    // tool-call fragments arrived and no finish_reason did,
+                    // the last call is truncated mid-accumulation — the loop
+                    // must not execute a half-parsed call, so this is an
+                    // error (review Important #4). Otherwise (text-only, or
+                    // a finish_reason already seen) the turn completed
+                    // semantically and only the `[DONE]` marker was lost:
+                    // keep the graceful Done.
+                    if self.saw_tool_call && self.last_finish_reason.is_none() {
+                        self.done = true;
+                        return Err(LlmError::Truncated);
+                    }
                     tracing::warn!("SSE stream ended without [DONE]");
                     self.done = true;
                     return Ok(Some(ChatEvent::Done(self.last_finish_reason)));
@@ -109,6 +128,7 @@ impl ChatStream {
                         // the rest of the chunk (the silent-loss bug the
                         // final review caught).
                         for tc in choice.delta.tool_calls.into_iter().flatten() {
+                            self.saw_tool_call = true;
                             let (name_fragment, args_fragment) = match tc.function {
                                 Some(f) => (f.name, f.arguments),
                                 None => (None, None),
@@ -230,6 +250,7 @@ impl LlmClient {
             sse,
             last_finish_reason: None,
             last_usage: None,
+            saw_tool_call: false,
             done: false,
             pending: VecDeque::new(),
         })

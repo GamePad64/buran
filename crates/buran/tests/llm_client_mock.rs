@@ -380,3 +380,43 @@ fn production_new_builds_client_with_retry_policy() {
     };
     let _client = LlmClient::new(&provider).expect("production client must construct");
 }
+
+/// Review Focus #1, strict reading (review Important #4): the SSE body
+/// ends mid-tool-call — a `ToolCallDelta` with a partial `arguments`
+/// fragment arrived, then the body ends WITHOUT `finish_reason` and
+/// WITHOUT `[DONE]` (gateway dropped the connection; clean EOF at the
+/// SSE layer). The stream must surface an ERROR (the turn fails), not a
+/// synthetic `Done` that would let the loop execute a truncated tool
+/// call. No retry happens either way (that risk is separate).
+#[tokio::test]
+async fn mid_stream_death_during_tool_call_accumulation_is_an_error() {
+    let m = hclient::mock::MockTransport::new();
+    m.push_response(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"fs__read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n".to_string())
+            .unwrap(),
+    );
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+
+    // First event: the partial tool-call delta (delivered verbatim).
+    let first = s.next().await.unwrap();
+    assert!(
+        matches!(
+            first,
+            Some(ChatEvent::ToolCallDelta { ref args_fragment, .. }) if args_fragment.as_deref() == Some("{\"pa")
+        ),
+        "partial delta must stream through: {first:?}"
+    );
+
+    // Next: the body is exhausted — clean EOF without [DONE]. Must be
+    // Err, not a synthetic Done carrying the partial state.
+    let outcome = s.next().await;
+    assert!(
+        outcome.is_err(),
+        "truncation mid-tool-call must fail the stream, got: {outcome:?}"
+    );
+}
