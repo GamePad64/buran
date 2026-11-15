@@ -294,6 +294,52 @@ async fn switch_session_failure_leaves_the_current_session_untouched() {
     client.shutdown();
 }
 
+/// Fake announcing its command registry after session/new: the TUI
+/// stores the registry for the slash menu (ADR 0006 announcement).
+fn fake_agent_with_commands() -> String {
+    r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session-1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact the conversation"}]}}}\n'
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"fake-session-1"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+    .to_string()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn commands_from_the_announcement_are_queryable() {
+    let client = AcpClient::spawn(
+        &format!("bash -c {}", shell_quote(&fake_agent_with_commands())),
+        None,
+        None,
+    )
+    .await
+    .expect("spawn");
+
+    // The announcement arrives as an event the UI applies to its
+    // registry; after draining it, the client exposes the list.
+    let event = tokio::time::timeout(TIMEOUT, client.next_event())
+        .await
+        .expect("announcement timed out")
+        .expect("connection closed before announcement");
+    let ClientEvent::Commands(commands) = event else {
+        panic!("expected Commands event, got {event:?}");
+    };
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].name, "compact");
+    assert_eq!(commands[0].description, "Compact the conversation");
+
+    client.shutdown();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn resume_latest_with_empty_store_fails_loudly() {
     // Empty HOME store: "latest" cannot resolve. The TUI must fail the

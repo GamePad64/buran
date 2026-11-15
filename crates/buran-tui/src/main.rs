@@ -132,6 +132,17 @@ async fn run_app(
                     app.question = Some(question);
                     Step::Continue
                 }
+                // Command registry (ADR 0006): the slash menu's source.
+                Some(ClientEvent::Commands(commands)) => {
+                    app.commands = commands
+                        .into_iter()
+                        .map(|c| ui::CommandRow {
+                            name: c.name,
+                            description: c.description,
+                        })
+                        .collect();
+                    Step::Continue
+                }
                 // Agent connection closed: exit cleanly.
                 None => Step::Quit,
             },

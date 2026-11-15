@@ -58,9 +58,17 @@ impl Picker {
     }
 }
 
+/// One row of the slash-completion menu: the protocol's AvailableCommand
+/// is flattened here so the view never reaches into the SDK types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRow {
+    pub name: String,
+    pub description: String,
+}
+
 /// Whole UI state: transcript, input buffer, pending permission question,
-/// scroll offset (`None` = stick to bottom), turn status, and the picker
-/// overlay when open.
+/// scroll offset (`None` = stick to bottom), turn status, the picker
+/// overlay when open, and the command registry + menu state.
 #[derive(Default)]
 pub struct App {
     pub entries: Vec<Entry>,
@@ -71,6 +79,30 @@ pub struct App {
     pub scroll: Option<u16>,
     pub streaming: bool,
     pub picker: Option<Picker>,
+    /// Slash commands from the agent's announcement (empty until one
+    /// arrives: an old agent = no menu, '/' just types).
+    pub commands: Vec<CommandRow>,
+    /// Menu selection while open; `None` = closed.
+    pub menu_selected: Option<usize>,
+}
+
+impl App {
+    /// Rows filtered by the current `/query` prefix — the render path
+    /// and the navigation bound. Empty while the menu is closed or the
+    /// input is not a `/query`.
+    pub fn menu_rows_filtered(&self) -> Vec<CommandRow> {
+        if self.menu_selected.is_none() {
+            return Vec::new();
+        }
+        let Some(query) = self.input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        self.commands
+            .iter()
+            .filter(|c| c.name.starts_with(query))
+            .cloned()
+            .collect()
+    }
 }
 
 impl App {
@@ -162,8 +194,70 @@ impl App {
                 }
                 Action::OpenPicker
             }
+            // Slash menu: '/' opens it (empty query = all commands), Tab
+            // completes the selected row into the input, Esc closes. The
+            // menu only ever shows rows matching the current `/query`, so
+            // Enter falls through to submit — a narrowed menu submits the
+            // completed command line as-is.
+            (_, KeyCode::Char('/'))
+                if self.menu_selected.is_none()
+                    && self.input.is_empty()
+                    && !self.commands.is_empty() =>
+            {
+                self.input.push('/');
+                self.menu_selected = Some(0);
+                Action::None
+            }
+            (_, KeyCode::Char(ch)) if self.menu_selected.is_some() => {
+                self.input.push(ch);
+                // Typing narrows the rows; keep the selection in range.
+                let rows = self.menu_rows_filtered().len();
+                if let Some(selected) = self.menu_selected.as_mut() {
+                    *selected = (*selected).min(rows.saturating_sub(1));
+                }
+                // A query that matches nothing closes the menu.
+                if rows == 0 {
+                    self.menu_selected = None;
+                }
+                Action::None
+            }
+            (_, KeyCode::Tab) if self.menu_selected.is_some() => {
+                let rows = self.menu_rows_filtered();
+                if let Some(selected) = self.menu_selected
+                    && let Some(row) = rows.get(selected)
+                {
+                    self.input = format!("/{}", row.name);
+                }
+                self.menu_selected = None;
+                Action::None
+            }
+            (_, KeyCode::Up) if self.menu_selected.is_some() => {
+                if let Some(selected) = self.menu_selected.as_mut() {
+                    *selected = selected.saturating_sub(1);
+                }
+                Action::None
+            }
+            (_, KeyCode::Down) if self.menu_selected.is_some() => {
+                let rows = self.menu_rows_filtered().len();
+                if let Some(selected) = self.menu_selected.as_mut() {
+                    *selected = (*selected + 1).min(rows.saturating_sub(1));
+                }
+                Action::None
+            }
+            (_, KeyCode::Esc) if self.menu_selected.is_some() => {
+                self.menu_selected = None;
+                Action::None
+            }
+            (_, KeyCode::Backspace) if self.menu_selected.is_some() => {
+                self.input.pop();
+                if !self.input.starts_with('/') {
+                    self.menu_selected = None;
+                }
+                Action::None
+            }
             (_, KeyCode::Enter) => {
                 let line = std::mem::take(&mut self.input);
+                self.menu_selected = None;
                 if line == ":quit" {
                     return Action::Quit;
                 }
@@ -204,15 +298,23 @@ impl App {
 
 /// Renders one frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [transcript, status, input] = Layout::vertical([
+    // When the slash menu is open, reserve 3 lines for it (title + up to 2
+    // rows) between status and input; otherwise the three-row layout is
+    // unchanged.
+    let menu_height = if app.menu_selected.is_some() { 3 } else { 0 };
+    let [transcript, status, menu, input] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
+        Constraint::Length(menu_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
     render_transcript(frame, app, transcript);
     render_status(frame, app, status);
+    if menu_height > 0 {
+        render_menu(frame, app, menu);
+    }
     render_input(frame, app, input);
     if let Some(picker) = &app.picker {
         render_picker(frame, picker, frame.area());
@@ -378,6 +480,34 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         )));
     }
     frame.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
+/// The slash-completion menu: up to two rows (name + description), the
+/// selected one highlighted. Drawn in the reserved band between status
+/// and input — an inline strip, not an overlay, so the transcript never
+/// hides behind it.
+fn render_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.menu_rows_filtered();
+    let selected = app
+        .menu_selected
+        .unwrap_or(0)
+        .min(rows.len().saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().take(2).enumerate() {
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let marker = if i == selected { " > " } else { "   " };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}/{}  {}", row.name, row.description),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_modal(frame: &mut Frame, question: &PermissionQuestion, area: Rect) {

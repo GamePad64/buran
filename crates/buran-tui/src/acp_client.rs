@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::AvailableCommand;
 use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOption, PermissionOptionKind,
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
@@ -120,6 +121,10 @@ pub enum ClientEvent {
     /// The agent asks which option to take; the UI answers through the
     /// question's `answer` method.
     Question(PermissionQuestion),
+    /// The agent's slash-command registry (ADR 0006 announcement): the
+    /// UI stores it for the completion menu. A client that never gets
+    /// this (older agent) simply has no menu.
+    Commands(Vec<AvailableCommand>),
 }
 
 /// How long the permission handler waits for the UI answer before
@@ -302,6 +307,11 @@ impl AcpClient {
                                     let _ =
                                         event_tx_chunk.send(ClientEvent::UserText(text.text)).await;
                                 }
+                            }
+                            SessionUpdate::AvailableCommandsUpdate(update) => {
+                                let _ = event_tx_chunk
+                                    .send(ClientEvent::Commands(update.available_commands))
+                                    .await;
                             }
                             _ => {}
                         }
