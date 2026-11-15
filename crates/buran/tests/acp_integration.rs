@@ -2043,3 +2043,60 @@ async fn production_turn_cuts_runaway_tool_loop_after_four_identical_rounds() {
         .expect("integration test timed out")
         .expect("ACP connection failed");
 }
+
+/// After `newSession` the agent announces its slash commands
+/// (`SessionUpdate::AvailableCommandsUpdate`): clients render completion
+/// menus from this, so the registry must name /compact with a human
+/// description. Announcement is an update notification, not a response
+/// field — a client on an older protocol ignores it gracefully.
+#[tokio::test(flavor = "current_thread")]
+async fn new_session_announces_available_commands_with_compact() {
+    let m = MockTransport::new();
+    let turn1 = format!("data: {}\n\n{}", text_chunk("x"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+
+    let agent = buran::acp::agent_builder_with_config(test_config(Vec::new()), move |_provider| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            hclient::Client::builder(m.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } =
+            cx.build_session_cwd()?.block_task().start_session().await?;
+
+        // The announcement rides the session's update stream around
+        // session start; force a read by prompting and collecting
+        // everything until the response.
+        session.send_prompt("hi")?;
+        let mut saw_compact = false;
+        loop {
+            let message = session.read_update().await?;
+            if let SessionMessage::PromptResponse(_) = message {
+                break;
+            }
+            if let Some(n) = as_notification(message)
+                && let SessionUpdate::AvailableCommandsUpdate(update) = n.update
+            {
+                saw_compact = update
+                    .available_commands
+                    .iter()
+                    .any(|c| c.name == "compact" && !c.description.is_empty());
+            }
+        }
+        assert!(
+            saw_compact,
+            "AvailableCommandsUpdate must list /compact with a description"
+        );
+        Ok(())
+    });
+
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("integration test timed out")
+        .expect("ACP connection failed");
+}

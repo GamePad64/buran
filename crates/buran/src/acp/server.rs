@@ -13,12 +13,12 @@ use agent_client_protocol::{
     Agent, Client as AcpClient, Stdio, on_receive_notification, on_receive_request,
     v1::ConnectionTo,
     v1::schema::{
-        AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-        InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-        NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
-        SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-        SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
+        ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, LoadSessionRequest,
+        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+        SessionId, SessionMode, SessionModeId, SessionModeState, SessionNotification,
+        SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+        ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     },
 };
 use tokio::sync::{mpsc, watch};
@@ -151,6 +151,16 @@ pub async fn agent_builder_with_config(
     Ok(build_agent(state, provider_for_agent))
 }
 
+/// The slash-command registry (ADR 0006): announced to clients after
+/// session start so they can render completion menus. Skills join this
+/// same registry when they become commands; one line each here.
+fn command_registry() -> Vec<AvailableCommand> {
+    vec![AvailableCommand::new(
+        "compact",
+        "Compact the conversation into a summary; optional text focuses what the summary keeps",
+    )]
+}
+
 fn build_agent(
     state: Arc<ServerState>,
     provider: ProviderConfig,
@@ -251,7 +261,16 @@ fn build_agent(
                     );
                 // Modes advertise the effective policy (the config value at
                 // session start); the client can switch per session via
-                // `session/set_mode` (hardening v1.5.1).
+                // `session/set_mode` (hardening v1.5.1). Commands announce
+                // on the update stream (ADR 0006): clients render
+                // completion menus from this; an announcement failure is
+                // cosmetic — the session works without the menu.
+                let _ = _cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                        command_registry(),
+                    )),
+                ));
                 responder.respond(
                     NewSessionResponse::new(session_id)
                         .modes(permission_modes(state_new_session.config.permission)),
@@ -373,7 +392,15 @@ fn build_agent(
                             .expect("sessions lock")
                             .insert(req.session_id.clone(), handle);
                         // Parity with newSession (hardening v1.5.1): the
-                        // loaded session advertises the same three modes.
+                        // loaded session advertises the same three modes —
+                        // and the same command registry (a resumed client
+                        // gets the completion menu too, ADR 0006).
+                        let _ = cx.send_notification(SessionNotification::new(
+                            req.session_id.clone(),
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                command_registry(),
+                            )),
+                        ));
                         let _ = responder.respond(
                             LoadSessionResponse::new()
                                 .modes(permission_modes(state_load.config.permission)),
