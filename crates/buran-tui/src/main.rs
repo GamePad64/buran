@@ -23,7 +23,11 @@ use acp_client::{AcpClient, ClientEvent, TurnHandle};
 use ui::App;
 
 #[derive(Parser)]
-#[command(name = "buran-tui", about = "TUI client for buran over ACP")]
+#[command(
+    name = "buran-tui",
+    about = "TUI client for buran over ACP",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     /// Agent command to spawn (defaults to `buran serve` from PATH).
     #[arg(long, default_value = "buran serve")]
