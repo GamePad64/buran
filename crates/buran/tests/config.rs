@@ -239,3 +239,53 @@ fn skills_dirs_merge_global_then_project() {
         ]
     );
 }
+
+#[test]
+fn compaction_defaults_and_toml_fields() {
+    // Defaults: auto ON (real work = not thinking about it), reserve 8192.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://x/v1\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert!(cfg.compaction.auto, "auto defaults ON");
+    assert_eq!(cfg.compaction.reserve, 8192);
+    assert_eq!(
+        cfg.provider.as_ref().unwrap().context_window,
+        None,
+        "context_window unset = None (128k hard default at use site)"
+    );
+
+    // TOML fields override.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[compaction]
+auto = false
+reserve = 4096
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    let comp = cfg.compaction;
+    assert!(!comp.auto, "auto = false in toml");
+    assert_eq!(comp.reserve, 4096);
+}
+
+#[test]
+fn provider_context_window_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://x/v1\"\nmodel = \"m\"\ncontext_window = 200000\n",
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert_eq!(cfg.provider.as_ref().unwrap().context_window, Some(200_000));
+}

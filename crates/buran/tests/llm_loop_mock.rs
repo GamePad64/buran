@@ -18,6 +18,7 @@ fn provider() -> ProviderConfig {
         base_url: "http://mock.test/v1".into(),
         model: "test-model".into(),
         api_key: ApiKey::Explicit("sk-test".into()),
+        context_window: None,
     }
 }
 

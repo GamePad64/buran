@@ -20,6 +20,7 @@ fn provider() -> ProviderConfig {
         base_url: "http://mock.test/v1".into(),
         model: "test-model".into(),
         api_key: ApiKey::Explicit("sk-test".into()),
+        context_window: None,
     }
 }
 
@@ -59,6 +60,7 @@ fn test_config() -> buran::config::Config {
         permission: buran::config::PermissionPolicy::Ask,
         permission_timeout: Duration::from_secs(2),
         sessions_dir: None,
+        compaction: Default::default(),
     }
 }
 

@@ -82,6 +82,7 @@ pub struct ProviderToml {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub model: Option<String>,
+    pub context_window: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +91,31 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: ApiKey,
+    /// The model's context window in tokens; `None` = unknown, callers
+    /// apply the 128k hard default (ADR 0006).
+    pub context_window: Option<usize>,
+}
+
+/// `[compaction]` settings (ADR 0006 trigger policy). Defaults keep
+/// auto-compaction ON: real work should not think about context growth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionConfig {
+    /// Compact automatically after a turn when the window estimate
+    /// crosses the threshold.
+    pub auto: bool,
+    /// Tokens reserved under the context window for the model's reply
+    /// and tool traffic; auto-compact triggers above
+    /// `context_window − reserve`.
+    pub reserve: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            reserve: 8192,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -171,6 +197,8 @@ pub struct Config {
     /// (`~/.local/state/buran/sessions`). Not a config-file key (YAGNI,
     /// sessions store spec): the field exists for tests and embedding.
     pub sessions_dir: Option<PathBuf>,
+    /// `[compaction]` trigger policy (ADR 0006).
+    pub compaction: CompactionConfig,
 }
 
 /// Serialized `[provider]` / top-level shape of a config file.
@@ -181,6 +209,14 @@ struct ConfigFile {
     mcp_servers: Vec<McpServerToml>,
     skills_dirs: Vec<String>,
     permissions: Option<PermissionsToml>,
+    compaction: Option<CompactionToml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct CompactionToml {
+    auto: Option<bool>,
+    reserve: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -210,6 +246,11 @@ impl Config {
         let mut mcp_servers: Vec<McpServerConfig> = Vec::new();
         let mut skills_dirs: Vec<PathBuf> = Vec::new();
         let mut permission = PermissionPolicy::Ask;
+        // Compaction fields merge field-wise like the provider: global
+        // sets the baseline, project overrides individual keys.
+        let mut compaction = CompactionConfig::default();
+        let mut compaction_auto: Option<bool> = None;
+        let mut compaction_reserve: Option<usize> = None;
         let mut seen_provider = false;
 
         if let Some(home) = home.as_deref() {
@@ -224,6 +265,10 @@ impl Config {
                     && let Some(policy) = PermissionPolicy::parse(&p)
                 {
                     permission = policy;
+                }
+                if let Some(c) = &file.compaction {
+                    compaction_auto = c.auto;
+                    compaction_reserve = c.reserve;
                 }
             }
         }
@@ -241,6 +286,14 @@ impl Config {
                     && let Some(policy) = PermissionPolicy::parse(&p)
                 {
                     permission = policy;
+                }
+                if let Some(c) = &file.compaction {
+                    if c.auto.is_some() {
+                        compaction_auto = c.auto;
+                    }
+                    if c.reserve.is_some() {
+                        compaction_reserve = c.reserve;
+                    }
                 }
             }
 
@@ -281,7 +334,15 @@ impl Config {
             } else {
                 ApiKey::FromEnv("BURAN_API_KEY".into())
             },
+            context_window: provider_toml.context_window,
         });
+
+        if let Some(auto) = compaction_auto {
+            compaction.auto = auto;
+        }
+        if let Some(reserve) = compaction_reserve {
+            compaction.reserve = reserve;
+        }
 
         Ok(Self {
             provider,
@@ -290,6 +351,7 @@ impl Config {
             permission,
             permission_timeout: std::time::Duration::from_secs(120),
             sessions_dir: None,
+            compaction,
         })
     }
 }
@@ -309,6 +371,9 @@ fn merge_provider(base: &mut ProviderToml, over: ProviderToml) {
     }
     if over.model.is_some() {
         base.model = over.model;
+    }
+    if over.context_window.is_some() {
+        base.context_window = over.context_window;
     }
 }
 

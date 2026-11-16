@@ -14,6 +14,7 @@ fn provider() -> ProviderConfig {
         base_url: "http://mock.test/v1".into(),
         model: "test-model".into(),
         api_key: ApiKey::Explicit("sk-test".into()),
+        context_window: None,
     }
 }
 
@@ -377,6 +378,7 @@ fn production_new_builds_client_with_retry_policy() {
         base_url: "https://api.example.com/v1".into(),
         model: "m".into(),
         api_key: ApiKey::Explicit("sk-x".into()),
+        context_window: None,
     };
     let _client = LlmClient::new(&provider).expect("production client must construct");
 }
