@@ -278,3 +278,88 @@ async fn compact_failure_leaves_conversation_untouched() {
         "the new turn is in the request too"
     );
 }
+
+/// Auto-compaction (ADR 0006 trigger policy): after a turn, when the
+/// window estimate crosses `context_window − reserve`, the agent
+/// compacts on its own — the next LLM request carries the summary, not
+/// the span — and announces `[auto-compacted …]` to the client. Reserve
+/// is set huge here so the threshold is crossed after one turn.
+#[tokio::test(flavor = "current_thread")]
+async fn auto_compact_fires_after_a_turn_crossing_the_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    // Round 1: the turn itself. Round 2: the auto-compact summary call.
+    // Round 3: the follow-up turn.
+    let turn1 = format!(
+        "data: {}\n\n{}",
+        text_chunk("long answer one"),
+        stop_and_done()
+    );
+    let summary = format!(
+        "data: {}\n\n{}",
+        text_chunk("AUTO SUMMARY"),
+        stop_and_done()
+    );
+    let turn2 = format!("data: {}\n\n{}", text_chunk("answer two"), stop_and_done());
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(summary.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(turn2.into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Some(dir.path().to_path_buf()));
+    // Threshold ≈ 0: any non-empty window crosses it.
+    config.compaction.auto = true;
+    config.compaction.reserve = 128_000;
+    config.provider.as_mut().unwrap().context_window = Some(128_000);
+
+    let agent = buran::acp::agent_builder_with_config(config, move |_p| {
+        Ok(LlmClient::with_transport(
+            provider(),
+            Http::builder(m2.clone()).build().unwrap(),
+        ))
+    })
+    .await
+    .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } = cx
+            .build_session(std::env::current_dir().unwrap())
+            .block_task()
+            .start_session()
+            .await?;
+
+        // Turn 1: history grows past the (zero) threshold; the
+        // auto-compaction note arrives as a chunk before the response.
+        session.send_prompt("first prompt")?;
+        let note = drain_to_response(&mut session).await?;
+        assert!(
+            note.contains("auto-compacted"),
+            "the client sees the auto-compaction: {note}"
+        );
+
+        // Turn 2: the request must carry the summary, not turn 1's text.
+        session.send_prompt("second prompt")?;
+        let _ = drain_to_response(&mut session).await?;
+        Ok(())
+    });
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("timed out")
+        .expect("connection failed");
+
+    let requests = m.requests();
+    assert!(
+        requests.len() >= 3,
+        "turn + summary + turn: {}",
+        requests.len()
+    );
+    assert!(
+        body_contains(&requests[2], "AUTO SUMMARY"),
+        "the next request carries the auto summary"
+    );
+    assert!(
+        !body_contains(&requests[2], "first prompt"),
+        "the compacted span (user half) left the window"
+    );
+}

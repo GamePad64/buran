@@ -73,6 +73,13 @@ struct ServerState {
     /// Shared with the per-turn event pump (`tokio::spawn` needs `'static`),
     /// which reads the session's effective permission policy per query.
     sessions: Arc<Mutex<HashMap<SessionId, SessionHandle>>>,
+    /// Auto-compaction knobs, resolved once at startup (ADR 0006): the
+    /// flat copies spare every post-turn check a config deref chain.
+    compaction_auto: bool,
+    compaction_reserve: usize,
+    /// `context_window` from the provider config; `None` = the 128k hard
+    /// default, materialized here so the check is one comparison.
+    provider_window: Option<usize>,
 }
 
 /// Builds the buran ACP agent from the real filesystem config and an
@@ -140,7 +147,15 @@ pub async fn agent_builder_with_config(
             .unwrap_or_else(crate::store::Store::default_root),
     );
 
+    let provider_window = config
+        .provider
+        .as_ref()
+        .and_then(|p| p.context_window)
+        .or(Some(128_000));
     let state = Arc::new(ServerState {
+        compaction_auto: config.compaction.auto,
+        compaction_reserve: config.compaction.reserve,
+        provider_window,
         config,
         store,
         mcp: Arc::new(mcp),
@@ -518,6 +533,54 @@ fn build_agent(
 /// `session/update` notifications, maps the finish reason to a StopReason.
 /// Cancellation maps to `Cancelled` (the protocol-required answer after
 /// `session/cancel`).
+/// One compaction pass over the CURRENT session state: cut the span
+/// (keeping `keep_tokens` of estimated tail), summarize it, append the
+/// `CompactionPoint` to the store, and record the boundary on the
+/// SessionState. Returns the number of messages compacted and the
+/// summary text. All-or-nothing: the store write precedes the state
+/// mutation; any failure leaves both untouched. Caller holds
+/// `turn_in_flight` (the session is taken out for the duration).
+async fn compact_session_once(
+    session: &mut SessionState,
+    writer: Option<&crate::store::WriterHandle>,
+    summarizer: &crate::compact::summarizer::BuiltinSummarizer,
+    keep_tokens: usize,
+    instructions: Option<&str>,
+) -> anyhow::Result<(usize, String)> {
+    let Some(cut) = crate::compact::cut_span(&session.history, keep_tokens) else {
+        anyhow::bail!("nothing to compact: history is within budget");
+    };
+    let span: Vec<crate::llm::types::ChatMessage> = session.history[..cut].to_vec();
+    let summary = summarizer
+        .summarize(&span, instructions, 512)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The store is the canon (ADR 0007): a failed write aborts the
+    // compaction before the in-memory boundary moves.
+    if let Some(writer) = writer {
+        writer
+            .append_acked(&crate::session::TranscriptRecord::CompactionPoint {
+                at_message: cut,
+                summary: Some(summary.clone()),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("store append failed: {e}"))?;
+    }
+    session.set_compaction(cut, Some(summary.clone()));
+    Ok((cut, summary))
+}
+
+/// Estimated tokens of the projection the next request would carry —
+/// the window the auto-compact threshold is measured against.
+fn window_estimate(session: &SessionState) -> usize {
+    session
+        .history
+        .iter()
+        .map(|m| m.content.as_deref().unwrap_or("").len())
+        .sum::<usize>()
+        .div_ceil(4)
+}
+
 /// `/compact [instructions]` (ADR 0006): cut the span, summarize it, and
 /// record a CompactionPoint — all-or-nothing. A Summarizer failure sends
 /// a message chunk and leaves the conversation untouched; the turn is a
@@ -554,34 +617,17 @@ async fn run_compact_command(
     let result = async {
         // Manual /compact always compacts the oldest half (ADR 0006:
         // keep_recent defaults chosen so a bare /compact roughly halves
-        // the window; budget knobs arrive with config plumbing).
-        let total_tokens: usize = session
-            .history
-            .iter()
-            .map(|m| m.content.as_deref().unwrap_or("").len())
-            .sum::<usize>()
-            .div_ceil(4);
-        let Some(cut) = crate::compact::cut_span(&session.history, total_tokens / 2) else {
-            anyhow::bail!("nothing to compact: history is within budget");
-        };
-        let span: Vec<crate::llm::types::ChatMessage> = session.history[..cut].to_vec();
-        let summary = summarizer
-            .summarize(&span, Some(instructions).filter(|s| !s.is_empty()), 512)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Both records BEFORE the state mutates: the store is the canon
-        // (ADR 0007); a failed write aborts the compaction.
-        if let Some(writer) = &writer {
-            writer
-                .append_acked(&crate::session::TranscriptRecord::CompactionPoint {
-                    at_message: cut,
-                    summary: Some(summary.clone()),
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("store append failed: {e}"))?;
-        }
-        session.set_compaction(cut, Some(summary.clone()));
-        Ok::<String, anyhow::Error>(summary)
+        // the window).
+        let keep = window_estimate(&session) / 2;
+        let (cut, summary) = compact_session_once(
+            &mut session,
+            writer.as_ref(),
+            &summarizer,
+            keep,
+            Some(instructions).filter(|s| !s.is_empty()),
+        )
+        .await?;
+        Ok::<(usize, String), anyhow::Error>((cut, summary))
     }
     .await;
 
@@ -595,16 +641,11 @@ async fn run_compact_command(
     }
 
     match result {
-        Ok(summary) => {
+        Ok((messages, summary)) => {
             let _ = conn.send_notification(SessionNotification::new(
                 session_id.clone(),
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    TextContent::new(format!(
-                        "[compacted {} messages: {}]",
-                        // Message count is cosmetic; the summary is the payload.
-                        summary.len(),
-                        summary
-                    )),
+                    TextContent::new(format!("[compacted {messages} messages: {summary}]")),
                 ))),
             ));
             Ok(StopReason::EndTurn)
@@ -732,7 +773,87 @@ async fn run_prompt_turn(
             }
         }
     }
+
+    // Auto-compaction (ADR 0006 trigger policy): after the turn is fully
+    // persisted and the guard cleared, the estimated window may cross
+    // `context_window − reserve`. The check reads the session briefly;
+    // the compaction itself takes the session out again (turn_in_flight
+    // is already false, so this cannot race a new prompt — the spawn task
+    // is still this one). Failure is logged and announced; the NEXT turn
+    // retries implicitly. A user-disabled auto mode never reaches here.
+    if state.compaction_auto
+        && result.is_ok()
+        && let Some(window) = state.provider_window
+    {
+        let est = {
+            let sessions = state.sessions.lock().expect("sessions lock");
+            sessions
+                .get(&req.session_id)
+                .map(|h| window_estimate(&h.session))
+                .unwrap_or(0)
+        };
+        if est > window.saturating_sub(state.compaction_reserve) {
+            match run_auto_compact(state, provider, &req.session_id, conn).await {
+                Ok(messages) => {
+                    let _ = conn.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new(format!("[auto-compacted {messages} messages]")),
+                        ))),
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "auto-compaction failed — will retry next turn");
+                    let _ = conn.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new(format!("[auto-compact failed: {error}]")),
+                        ))),
+                    ));
+                }
+            }
+        }
+    }
+
     result.map_err(PromptError::MidTurn).map(|(stop, _)| stop)
+}
+
+/// One silent compaction pass for the auto path: take the session out,
+/// cut keeping HALF the current window (auto keeps more than manual —
+/// the goal is fitting the budget, not shrinking hard), summarize,
+/// record. Returns the compacted message count.
+async fn run_auto_compact(
+    state: &ServerState,
+    provider: &ProviderConfig,
+    session_id: &SessionId,
+    _conn: &ConnectionTo<AcpClient>,
+) -> anyhow::Result<usize> {
+    let llm = (state.llm_factory)(provider)?;
+    let summarizer = crate::compact::summarizer::BuiltinSummarizer::new(llm);
+    let (mut session, writer) = {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        let handle = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown session"))?;
+        (
+            std::mem::take(&mut handle.session),
+            handle.store_file.clone(),
+        )
+    };
+    let outcome = async {
+        let keep = window_estimate(&session) / 2;
+        let (messages, _summary) =
+            compact_session_once(&mut session, writer.as_ref(), &summarizer, keep, None).await?;
+        Ok::<usize, anyhow::Error>(messages)
+    }
+    .await;
+    {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        if let Some(handle) = sessions.get_mut(session_id) {
+            handle.session = session;
+        }
+    }
+    outcome
 }
 
 /// Everything a turn body needs from its session, taken under the sessions
