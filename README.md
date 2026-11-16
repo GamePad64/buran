@@ -40,10 +40,18 @@ Global config at `~/.config/buran/config.toml`; project-level `buran.config.toml
 base_url = "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
 api_key = "sk-..."                        # or leave unset and export BURAN_API_KEY
 model = "gpt-4o-mini"
+context_window = 128000                   # optional: tokens; auto-compact threshold
 
 # Optional: permission policy for MCP tool calls (default "ask")
 [permissions]
 policy = "ask"        # allow_all | deny_all | ask
+
+# Optional: context compaction (ADR 0006). Auto is ON by default: after a
+# turn, if the window estimate crosses context_window − reserve, the
+# conversation is summarized and the next request carries summary + tail.
+[compaction]
+auto = true
+reserve = 8192       # tokens kept under the window for replies + tools
 
 # Optional: extra skill directories
 skills_dirs = ["~/.buran/skills"]
@@ -98,6 +106,8 @@ buran sessions rm <id>         # delete
 Switching sessions live: **Ctrl-R** in buran-tui opens the session picker — sessions created in the current directory, newest first, titled by their first user message. `Enter` attaches via `loadSession`; the conversation replays into the view. Sessions from other directories are counted, not listed (they cannot be loaded here). A session's title is its first user message, whitespace-collapsed, capped at 80 characters.
 
 Resume semantics: `serve` validates the id before the ACP channel opens; a client then attaches to the stored conversation via `session/loadSession` (cwd must match the session's recorded cwd), and the agent replays the stored conversation to the client as `session/update` notifications before the load response. A torn final line (crash mid-append) replays up to the last good line; unknown record types are skipped for forward compatibility.
+
+Compaction: `/compact [instructions]` summarizes the older half of the conversation into a summary; the LLM window becomes summary + kept tail instead of the full history. **Auto-compaction is on by default** (ADR 0006): after a turn, when the window estimate crosses `context_window − reserve` (default window 128k, reserve 8k), the same compaction runs silently and the client sees a `[auto-compacted N messages]` note. Set `[compaction] auto = false` to require the manual command.
 
 ## ACP contract
 
