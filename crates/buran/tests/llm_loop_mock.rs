@@ -598,3 +598,94 @@ mod hooks_tests {
         assert!(!body.contains("-HOOKED"), "no rewrite happened: {body}");
     }
 }
+
+mod on_turn_end_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn on_turn_end_fires_with_stop_reason_and_failing_hook_is_harmless() {
+        // A real hook writing the event to a file we can check.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.json");
+        let hook = format!("cat >> {}", marker.display());
+
+        let m = MockTransport::new();
+        let frames = format!(
+            "data: {}\n\n{}",
+            text_chunk("plain answer"),
+            stop_chunk("plain answer")
+        );
+        m.push_response_frames(sse(vec![Box::leak(frames.into_boxed_str())]));
+        let m2 = m.clone();
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let answerer = tokio::spawn(async move {
+            while let Some(ev) = events_rx.recv().await {
+                if let TurnEvent::PermissionQuery(_) = &ev {
+                    let _ = perm_tx.send(PermissionDecision::Allow).await;
+                }
+            }
+        });
+
+        let loop_ = AgentLoop::new(
+            LlmClient::with_transport(
+                provider(),
+                hclient::Client::builder(m2.clone()).build().unwrap(),
+            ),
+            Arc::new(StubCaller::default()),
+            "be helpful".to_string(),
+        )
+        .with_on_turn_end(Some(hook));
+        let mut session = SessionState::default();
+        let summary = loop_
+            .run_turn(&mut session, "hi", events_tx, perm_rx, cancel_rx)
+            .await
+            .unwrap();
+        answerer.abort();
+        assert_eq!(summary.finish, FinishReason::Stop);
+
+        let recorded = std::fs::read_to_string(&marker).expect("hook fired, file written");
+        assert!(
+            recorded.contains("on_turn_end") && recorded.contains("Stop"),
+            "the stop reason reached the hook: {recorded}"
+        );
+
+        // A failing hook changes nothing.
+        let m = MockTransport::new();
+        let frames = format!("data: {}\n\n{}", text_chunk("second"), stop_chunk("second"));
+        m.push_response_frames(sse(vec![Box::leak(frames.into_boxed_str())]));
+        let m2 = m.clone();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let answerer = tokio::spawn(async move {
+            while let Some(ev) = events_rx.recv().await {
+                if let TurnEvent::PermissionQuery(_) = &ev {
+                    let _ = perm_tx.send(PermissionDecision::Allow).await;
+                }
+            }
+        });
+        let loop_ = AgentLoop::new(
+            LlmClient::with_transport(
+                provider(),
+                hclient::Client::builder(m2.clone()).build().unwrap(),
+            ),
+            Arc::new(StubCaller::default()),
+            "be helpful".to_string(),
+        )
+        .with_on_turn_end(Some("definitely-not-a-command-xyz".into()));
+        let mut session = SessionState::default();
+        let summary = loop_
+            .run_turn(&mut session, "hi", events_tx, perm_rx, cancel_rx)
+            .await
+            .unwrap();
+        answerer.abort();
+        assert_eq!(
+            summary.finish,
+            FinishReason::Stop,
+            "failing hook is harmless"
+        );
+    }
+}

@@ -92,6 +92,25 @@ Project instructions, read automatically (the way Claude Code reads CLAUDE.md). 
 
 On first run, `buran doctor` detects an empty MCP configuration and offers **ACT** (MCP-over-stdio) as the ready-made tool set — including its filesystem component, which is the way buran gets file tools (there is no bundled fs server; all tools are external, by design). The offer prints the ready-to-paste config line; the harness itself has no ACT-specific code.
 
+## Hooks (v2.1)
+
+User-configurable reactions to harness events — the logic lives entirely outside the binary (ADR 0012):
+
+```toml
+[hooks]
+# Run after each tool result; a {"result": "..."} JSON response REWRITES
+# what the model sees (the rtk pattern: compress tool output).
+post_tool_use = "rtk hook post-tool"
+
+# Observe-only: fires when a turn resolves, with the stop reason
+# (bell/notify workflows).
+on_turn_end = "my-bell"
+
+timeout_secs = 10   # per-hook wall-clock cap
+```
+
+Contract: each hook is a shell command; the event JSON arrives on stdin, the hook's stdout carries its response. Fail-open everywhere — a hook that fails, times out, or emits garbage never breaks a turn (the original value passes through).
+
 ## Subagents (v2, opt-in)
 
 Delegate subtasks to parallel buran agents — via a bundled MCP server, no harness magic:

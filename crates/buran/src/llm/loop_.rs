@@ -191,6 +191,9 @@ pub struct AgentLoop {
     /// `post_tool_use` hook command (ADR 0012): may rewrite tool results
     /// before they enter history. `None` = disabled.
     post_tool_use: Option<String>,
+    /// `on_turn_end` hook command (ADR 0012): observe-only, fires when the
+    /// turn resolves (any finish reason). `None` = disabled.
+    on_turn_end: Option<String>,
     skills: Vec<crate::skills::SkillDescription>,
 }
 
@@ -201,6 +204,7 @@ impl AgentLoop {
             tools,
             system,
             post_tool_use: None,
+            on_turn_end: None,
             tool_defs: Vec::new(),
             tool_map: BTreeMap::new(),
             max_turns: 32,
@@ -261,12 +265,47 @@ impl AgentLoop {
         self
     }
 
+    /// Sets the `on_turn_end` hook command (ADR 0012): observe-only, fires
+    /// with the stop reason when the turn resolves. `None` = disabled.
+    pub fn with_on_turn_end(mut self, command: Option<String>) -> Self {
+        self.on_turn_end = command;
+        self
+    }
+
     /// Runs one user prompt to completion, streaming events on `events` and
     /// asking `permissions` for every tool call (decisions arrive on the
     /// paired sender; a closed channel or cancellation denies).
     ///
     /// Cancellation unwinds the turn into a clean `Stop` summary.
+    /// Runs the turn; on resolution, fires the `on_turn_end` hook (ADR
+    /// 0012) with the stop reason. Observe-only: the hook's output is
+    /// ignored and a failing hook never changes the turn result.
     pub async fn run_turn(
+        &self,
+        session: &mut SessionState,
+        user_text: &str,
+        events: mpsc::Sender<TurnEvent>,
+        permissions: mpsc::Receiver<PermissionDecision>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<TurnSummary, super::LlmError> {
+        let summary = self
+            .run_turn_inner(session, user_text, events, permissions, cancel)
+            .await;
+        if let (Some(command), Ok(res)) = (&self.on_turn_end, &summary) {
+            let reason = format!("{:?}", res.finish);
+            let event = serde_json::json!({
+                "event": "on_turn_end",
+                "stop_reason": reason,
+            });
+            if crate::hooks::run_hook(command, &event, std::time::Duration::from_secs(10)).is_none()
+            {
+                tracing::warn!("on_turn_end hook failed — ignored (observe-only)");
+            }
+        }
+        summary
+    }
+
+    async fn run_turn_inner(
         &self,
         session: &mut SessionState,
         user_text: &str,
