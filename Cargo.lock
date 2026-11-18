@@ -429,7 +429,7 @@ checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "buran"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-http",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "buran-tui"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
