@@ -426,3 +426,41 @@ command = "/bin/true"
         "the subagents entry is dropped (depth ≤ 2, mechanically)"
     );
 }
+
+#[test]
+fn hooks_section_parse_and_defaults() {
+    // Absent: no hooks, standard timeout default.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://x/v1\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert!(cfg.hooks.post_tool_use.is_none());
+    assert!(cfg.hooks.on_turn_end.is_none());
+    assert_eq!(cfg.hooks.timeout_secs, 10);
+
+    // Present: commands parse.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[hooks]
+post_tool_use = "rtk hook post-tool"
+on_turn_end = "my-bell"
+timeout_secs = 3
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert_eq!(
+        cfg.hooks.post_tool_use.as_deref(),
+        Some("rtk hook post-tool")
+    );
+    assert_eq!(cfg.hooks.on_turn_end.as_deref(), Some("my-bell"));
+    assert_eq!(cfg.hooks.timeout_secs, 3);
+}

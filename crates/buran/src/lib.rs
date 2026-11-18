@@ -3,6 +3,7 @@ pub mod agentsmd;
 pub mod compact;
 pub mod config;
 pub mod doctor;
+pub mod hooks;
 pub mod llm;
 pub mod mcp;
 pub mod run;

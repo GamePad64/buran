@@ -63,6 +63,7 @@ fn test_config() -> buran::config::Config {
         compaction: Default::default(),
         subagents: Default::default(),
         subagent_parent: None,
+        hooks: Default::default(),
     }
 }
 
