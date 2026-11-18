@@ -506,7 +506,7 @@ mod hooks_tests {
         )
     }
 
-    async fn hooked_turn(hook_command: &str, tool_result: &str) -> (Vec<String>, String) {
+    async fn hooked_turn(hook_command: &str) -> String {
         // Mock LLM: round 1 = tool call; round 2 = plain answer.
         let m = MockTransport::new();
         let frames1 = format!("data: {}\n\n{}", text_chunk(""), tool_call_frame());
@@ -522,10 +522,6 @@ mod hooks_tests {
         let caller = StubCaller {
             real_calls: AtomicUsize::new(0),
         };
-        // The hook: a real `sh -c` process that appends a marker to the
-        // JSON result field it receives on stdin.
-        let hook_script = format!(r#"sed 's/{tool_result}/&-HOOKED/'"#);
-        let _ = hook_script;
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
@@ -572,16 +568,15 @@ mod hooks_tests {
         // The tool result + hook outcome live in session history; the
         // next request body is captured by the mock.
         let requests = m.requests();
-        let last_body = requests
+        requests
             .last()
             .and_then(|r| r.body.text().map(|s| s.to_string()))
-            .unwrap_or_default();
-        (vec![], last_body)
+            .unwrap_or_default()
     }
 
     #[tokio::test]
     async fn rewritten_result_reaches_the_next_request() {
-        let (_, body) = hooked_turn("sed", "file body").await;
+        let body = hooked_turn("sed").await;
         assert!(
             body.contains("-HOOKED"),
             "the hook-rewritten result rides the next request: {body}"
@@ -590,7 +585,7 @@ mod hooks_tests {
 
     #[tokio::test]
     async fn broken_hook_fails_open_with_the_original() {
-        let (_, body) = hooked_turn("none", "file body").await;
+        let body = hooked_turn("none").await;
         assert!(
             body.contains("file body"),
             "fail-open keeps the original: {body}"
@@ -686,6 +681,73 @@ mod on_turn_end_tests {
             summary.finish,
             FinishReason::Stop,
             "failing hook is harmless"
+        );
+    }
+}
+
+mod hooks_edge_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_stdout_exit0_hook_fails_open_original_result_kept() {
+        // A silent exit-0 hook (bell script reused as post_tool_use, or
+        // an rtk with nothing to say) must NOT blank the tool result —
+        // the reviewer's Critical: "" rewrote every result silently.
+        let m = MockTransport::new();
+        // One tool call round, then answer.
+        let call = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"fs__read","arguments":"{}"}}]}},{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        m.push_response_frames(sse(vec![Box::leak(call.into())]));
+        let frames2 = format!("data: {}\n\n{}", text_chunk("done"), stop_chunk("done"));
+        m.push_response_frames(sse(vec![Box::leak(frames2.into_boxed_str())]));
+        let m2 = m.clone();
+
+        let caller = Arc::new(StubCaller::default());
+        let entry = buran::mcp::ToolEntry {
+            server: "fs".into(),
+            tool: buran::mcp::McpTool::new("read", "read a file", serde_json::Map::new()),
+        };
+        let loop_ = AgentLoop::new(
+            LlmClient::with_transport(
+                provider(),
+                hclient::Client::builder(m2.clone()).build().unwrap(),
+            ),
+            caller,
+            "be helpful".to_string(),
+        )
+        .with_catalog(&buran::mcp::ToolCatalog::new(vec![entry]))
+        // Silent exit-0 hook.
+        .with_post_tool_use(Some("true".into()));
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let answerer = tokio::spawn(async move {
+            while let Some(ev) = events_rx.recv().await {
+                if let TurnEvent::PermissionQuery(_) = &ev {
+                    let _ = perm_tx.send(PermissionDecision::Allow).await;
+                }
+            }
+        });
+        let mut session = SessionState::default();
+        let summary = loop_
+            .run_turn(&mut session, "use the tool", events_tx, perm_rx, cancel_rx)
+            .await
+            .unwrap();
+        answerer.abort();
+        assert_eq!(summary.finish, FinishReason::Stop);
+
+        // The tool result in history is NOT blanked.
+        let tool_msg = session
+            .history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool message in history");
+        assert!(
+            tool_msg.content.as_deref() == Some("file body"),
+            "empty-stdout exit-0 hook must fail-open with the original: {tool_msg:?}"
         );
     }
 }

@@ -194,6 +194,8 @@ pub struct AgentLoop {
     /// `on_turn_end` hook command (ADR 0012): observe-only, fires when the
     /// turn resolves (any finish reason). `None` = disabled.
     on_turn_end: Option<String>,
+    /// Per-hook wall-clock cap, seconds (from `[hooks] timeout_secs`).
+    hook_timeout_secs: u64,
     skills: Vec<crate::skills::SkillDescription>,
 }
 
@@ -205,6 +207,7 @@ impl AgentLoop {
             system,
             post_tool_use: None,
             on_turn_end: None,
+            hook_timeout_secs: 10,
             tool_defs: Vec::new(),
             tool_map: BTreeMap::new(),
             max_turns: 32,
@@ -266,9 +269,16 @@ impl AgentLoop {
     }
 
     /// Sets the `on_turn_end` hook command (ADR 0012): observe-only, fires
-    /// with the stop reason when the turn resolves. `None` = disabled.
+    /// with the stop reason when the turn resolves CLEANLY (an errored
+    /// turn — spawn/provider failures — does not fire it). `None` = disabled.
     pub fn with_on_turn_end(mut self, command: Option<String>) -> Self {
         self.on_turn_end = command;
+        self
+    }
+
+    /// Per-hook wall-clock cap (from `[hooks] timeout_secs`).
+    pub fn with_hook_timeout_secs(mut self, secs: u64) -> Self {
+        self.hook_timeout_secs = secs;
         self
     }
 
@@ -297,8 +307,18 @@ impl AgentLoop {
                 "event": "on_turn_end",
                 "stop_reason": reason,
             });
-            if crate::hooks::run_hook(command, &event, std::time::Duration::from_secs(10)).is_none()
-            {
+            let command = command.clone();
+            let timeout = std::time::Duration::from_secs(self.hook_timeout_secs);
+            // spawn_blocking: see the post_tool_use call site.
+            let fired = tokio::task::spawn_blocking(move || {
+                crate::hooks::run_hook(&command, &event, timeout)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("on_turn_end hook task panicked — ignored");
+                None
+            });
+            if fired.is_none() {
                 tracing::warn!("on_turn_end hook failed — ignored (observe-only)");
             }
         }
@@ -502,18 +522,54 @@ impl AgentLoop {
                                 "result": output.text,
                                 "is_error": output.is_error,
                             });
-                            match crate::hooks::run_hook(
-                                command,
-                                &event,
-                                std::time::Duration::from_secs(10),
-                            ) {
+                            let command_for_hook = command.clone();
+                            let event = event.clone();
+                            let timeout = std::time::Duration::from_secs(self.hook_timeout_secs);
+                            // AGENTS.md: no blocking I/O inside the tokio
+                            // context — the sync runner parks its worker
+                            // for up to `timeout`.
+                            match tokio::task::spawn_blocking(move || {
+                                crate::hooks::run_hook(&command_for_hook, &event, timeout)
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                tracing::warn!("hook task panicked — fail-open");
+                                None
+                            }) {
+                                // Empty stdout on exit 0 is the classic
+                                // misconfiguration (a bell/notify script
+                                // reused as post_tool_use): blanking every
+                                // tool result silently would lose all tool
+                                // output — fail-open with the original.
+                                Some(out) if out.is_empty() => {
+                                    tracing::warn!(
+                                        %command,
+                                        "hook returned empty output — keeping the original result"
+                                    );
+                                    output.text
+                                }
                                 Some(out) => {
                                     match serde_json::from_str::<serde_json::Value>(&out) {
-                                        Ok(v) => v
-                                            .get("result")
-                                            .and_then(|r| r.as_str())
-                                            .map(str::to_string)
-                                            .unwrap_or_else(|| output.text),
+                                        Ok(v) => {
+                                            match v.get("result") {
+                                                Some(r) => match r.as_str() {
+                                                    Some(s) => s.to_string(),
+                                                    // Non-string result (an
+                                                    // object): serialize it so
+                                                    // the model still sees it.
+                                                    None => r.to_string(),
+                                                },
+                                                // Valid JSON without a "result"
+                                                // field: original passes.
+                                                None => {
+                                                    tracing::warn!(
+                                                        %command,
+                                                        "hook JSON has no \"result\" field — keeping the original"
+                                                    );
+                                                    output.text
+                                                }
+                                            }
+                                        }
                                         // Not JSON (plain text echo): treat the
                                         // whole output as the rewritten result.
                                         Err(_) => out,

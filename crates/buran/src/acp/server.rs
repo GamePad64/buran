@@ -1018,7 +1018,8 @@ async fn run_prompt_turn_inner(
         .with_same_tool_streak_guard(4)
         // User event hooks (ADR 0012) from `[hooks]` in the config.
         .with_post_tool_use(state.config.hooks.post_tool_use.clone())
-        .with_on_turn_end(state.config.hooks.on_turn_end.clone());
+        .with_on_turn_end(state.config.hooks.on_turn_end.clone())
+        .with_hook_timeout_secs(state.config.hooks.timeout_secs);
 
     let (events_tx, mut events_rx) = mpsc::channel::<TurnEvent>(64);
     let (perm_tx, perm_rx) = mpsc::channel::<PermissionDecision>(8);
