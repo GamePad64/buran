@@ -117,10 +117,17 @@ impl ChatStream {
                     if let Some(usage) = chunk.usage {
                         self.last_usage = Some(usage);
                     }
-                    for choice in chunk.choices {
+                    // Capture the finish BEFORE yielding events: a chunk
+                    // may carry both content and finish (coalescing
+                    // gateways), and the first pending event returns below
+                    // mid-loop — a finish captured after that return would
+                    // be lost until the next chunk, which may be [DONE].
+                    for choice in &chunk.choices {
                         if choice.finish_reason.is_some() {
                             self.last_finish_reason = choice.finish_reason;
                         }
+                    }
+                    for choice in chunk.choices {
                         // A chunk may carry BOTH text and tool-call
                         // fragments (coalescing gateways do this): buffer
                         // the tool fragments FIRST, then queue the text

@@ -5,7 +5,7 @@
 //! transport itself is fully scripted.
 
 use buran::config::{ApiKey, ProviderConfig};
-use buran::llm::types::ChatRequest;
+use buran::llm::types::{ChatRequest, FinishReason};
 use buran::llm::{ChatEvent, LlmClient};
 
 fn provider() -> ProviderConfig {
@@ -421,4 +421,33 @@ async fn mid_stream_death_during_tool_call_accumulation_is_an_error() {
         outcome.is_err(),
         "truncation mid-tool-call must fail the stream, got: {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn two_choices_one_chunk_yields_content_and_length_finish() {
+    // Gateway-shaped chunk: choice0 carries content, choice1 carries
+    // finish_reason — both in ONE SSE data frame.
+    let m = hclient::mock::MockTransport::new();
+    let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"partial prose\"}},{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+    m.push_response_frames(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(vec![frame])
+            .unwrap(),
+    );
+    let llm = LlmClient::with_transport(provider(), hclient::Client::builder(m).build().unwrap());
+    let req = ChatRequest::new("test-model", vec![]);
+    let mut s = llm.stream_chat(&req).await.unwrap();
+    let mut text = String::new();
+    let mut finish = None;
+    while let Some(ev) = s.next().await.unwrap() {
+        match ev {
+            ChatEvent::Delta(t) => text.push_str(&t),
+            ChatEvent::Done(f) => finish = f,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "partial prose");
+    assert!(matches!(finish, Some(FinishReason::Length)));
 }
