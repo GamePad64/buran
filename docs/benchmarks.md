@@ -42,6 +42,7 @@ agent-side only.
 | Binary / install size | **9.8 MB** buran + **3.9 MB** buran-tui (two stripped ELFs; axum stack for `--listen` inside the buran number, ADR 0010) | 152 MB per release (314 MB with old release kept) | 279 MB install + 71 MB plugins = **350 MB** | not measured |
 | Idle process RSS | **~6.2 MB** (serve, waiting) | — | — | not measured |
 | One process, one active session (prompt-turn peak) | **9.5–9.6 MB** (was 8.8–9.0 pre-axum; budget 10 MB — headroom ~0.4 MB, watched) | ~104–148 MB (node runtime floor ~45 MB) | ~100–400 MB per process | not measured |
+| Session with a live MCP server (harness + tool child) | harness **8.9 MB** peak with 1 server connected, **9.3 MB** with 2; each `mcp-server-filesystem` child ≈ **85 MB** node RSS — the harness stays light, the tools don't (measured 2026-11-18, local npx-cached server, no network) | tools are separate node processes, same ~50–100 MB each | same shape: every tool server is a node child | not measured |
 | Interactive fleet (this machine, just now) | n/a (one process per session by design; N HTTP sessions share one process) | 148 MB (one TUI, 90 min) | **1 754 MB** total: 11 `bg-spare` processes 77–405 MB each + daemon 99 MB + `agents` 147 MB | not measured |
 | Cold start (spawn → accepts first RPC) | **p50 4 ms** (10 runs, min 2, max 7) | ~0.4 s to config-loaded failure; ~1 s+ warm one-shot end-to-end | seconds (node + 350 MB tree) | not measured |
 | One-shot prompt roundtrip (same gateway) | **18–25 ms** agent-side overhead (wall 0.4–1.7 s incl. LLM — gateway varies) | 0.5–3.4 s wall (LiteLLM discovery on cold runs; warm ~0.5–1.4 s) | not comparable headless (bg-spare fleet is the resident cost) | not measured |
@@ -63,10 +64,11 @@ agent-side only.
 - buran one-shot agent-side overhead (16–34 ms) excludes the LLM; wall
   time for the same prompt on the same gateway was ~1.4 s for both buran
   and pi — the difference is the ~30× smaller agent-side share.
-- Session-with-tools numbers (MCP servers spawned) are not yet measured;
-  each `npx`-based MCP server adds ~50–100 MB of node for *any* agent,
-  including buran. Lightness of the harness does not lightness-apply to
-  the tools it spawns. Measure before claiming.
+- Session-with-tools numbers measured 2026-11-18 (see table): the
+  harness row stays honest — buran itself barely moves (8.9 → 9.3 MB
+  adding a second server, catalog bookkeeping only) — but each
+  node-based MCP child carries its own ~85 MB. Lightness of the harness
+  does not lightness-apply to the tools it spawns.
 
 ## What this document is for
 
