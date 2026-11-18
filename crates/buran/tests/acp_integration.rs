@@ -104,6 +104,7 @@ fn test_config(skills_dirs: Vec<std::path::PathBuf>) -> buran::config::Config {
         permission_timeout: Duration::from_secs(2),
         sessions_dir: None,
         compaction: Default::default(),
+        subagents: Default::default(),
     }
 }
 

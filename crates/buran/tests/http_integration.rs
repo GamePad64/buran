@@ -61,6 +61,7 @@ fn test_config() -> buran::config::Config {
         permission_timeout: Duration::from_secs(2),
         sessions_dir: None,
         compaction: Default::default(),
+        subagents: Default::default(),
     }
 }
 

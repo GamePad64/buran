@@ -214,6 +214,43 @@ pub struct Config {
     pub sessions_dir: Option<PathBuf>,
     /// `[compaction]` trigger policy (ADR 0006).
     pub compaction: CompactionConfig,
+    /// `[subagents]` delegation policy (ADR 0011): opt-in server.
+    pub subagents: SubagentsConfig,
+}
+
+/// `[subagents]`: the delegation server's knobs. Disabled by default —
+/// the user opts in by adding the section and registering the server in
+/// `.mcp.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentsConfig {
+    pub enabled: bool,
+    /// Child provider override; `None` = children inherit the parent's.
+    pub provider: Option<SummarizerProvider>,
+    /// Hard cap of live child agents.
+    pub max_children: usize,
+    /// Default child wall-clock, seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: None,
+            max_children: 4,
+            timeout_secs: 600,
+        }
+    }
+}
+
+/// Drops the `subagents` MCP entry from a config: the depth-≤-2 rule,
+/// mechanically. A child spawned with the filtered config has no spawn
+/// tool, so grandchildren are impossible — one filter, no harness branch.
+pub fn filter_for_subagent(mut config: Config) -> Config {
+    config
+        .mcp_servers
+        .retain(|server| server.name != "subagents");
+    config
 }
 
 /// Serialized `[provider]` / top-level shape of a config file.
@@ -225,6 +262,16 @@ struct ConfigFile {
     skills_dirs: Vec<String>,
     permissions: Option<PermissionsToml>,
     compaction: Option<CompactionToml>,
+    subagents: Option<SubagentsToml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct SubagentsToml {
+    enabled: Option<bool>,
+    provider: Option<SummarizerProvider>,
+    max_children: Option<usize>,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -268,6 +315,7 @@ impl Config {
         let mut compaction_auto: Option<bool> = None;
         let mut compaction_reserve: Option<usize> = None;
         let mut compaction_summarizer: Option<SummarizerProvider> = None;
+        let mut subagents = SubagentsConfig::default();
         let mut seen_provider = false;
 
         if let Some(home) = home.as_deref() {
@@ -287,6 +335,20 @@ impl Config {
                     compaction_auto = c.auto;
                     compaction_reserve = c.reserve;
                     compaction_summarizer = c.summarizer.clone();
+                }
+                if let Some(s) = &file.subagents {
+                    if let Some(enabled) = s.enabled {
+                        subagents.enabled = enabled;
+                    }
+                    if s.provider.is_some() {
+                        subagents.provider = s.provider.clone();
+                    }
+                    if let Some(max_children) = s.max_children {
+                        subagents.max_children = max_children;
+                    }
+                    if let Some(timeout_secs) = s.timeout_secs {
+                        subagents.timeout_secs = timeout_secs;
+                    }
                 }
             }
         }
@@ -314,6 +376,20 @@ impl Config {
                     }
                     if c.summarizer.is_some() {
                         compaction_summarizer = c.summarizer.clone();
+                    }
+                }
+                if let Some(s) = &file.subagents {
+                    if let Some(enabled) = s.enabled {
+                        subagents.enabled = enabled;
+                    }
+                    if s.provider.is_some() {
+                        subagents.provider = s.provider.clone();
+                    }
+                    if let Some(max_children) = s.max_children {
+                        subagents.max_children = max_children;
+                    }
+                    if let Some(timeout_secs) = s.timeout_secs {
+                        subagents.timeout_secs = timeout_secs;
                     }
                 }
                 // Project [[mcp_servers]] merge like lists do (README:
@@ -378,6 +454,7 @@ impl Config {
             permission_timeout: std::time::Duration::from_secs(120),
             sessions_dir: None,
             compaction,
+            subagents,
         })
     }
 }

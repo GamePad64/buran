@@ -35,6 +35,13 @@ enum Command {
         /// TLS/auth beyond it. Without the flag, stdio.
         #[arg(long)]
         listen: Option<std::net::SocketAddr>,
+        /// Marks this server as a SUBAGENT (ADR 0011): the `subagents`
+        /// MCP entry is filtered from the config (depth ≤ 2 — a child
+        /// cannot spawn children), and the transcript is marked
+        /// `subagent_of` the parent session. Set by `buran subagents`,
+        /// not by humans.
+        #[arg(long)]
+        subagent: bool,
     },
     /// Probe config and MCP servers, offer ACT on first run
     Doctor,
@@ -70,12 +77,14 @@ fn main() -> anyhow::Result<()> {
         resume: None,
         fork: None,
         listen: None,
+        subagent: false,
     }) {
         Command::Serve {
             resume,
             fork,
             listen,
-        } => buran::run::serve(resume, fork, listen),
+            subagent,
+        } => buran::run::serve(resume, fork, listen, subagent),
         Command::Doctor => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

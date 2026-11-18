@@ -37,6 +37,7 @@ fn test_config(sessions_dir: Option<std::path::PathBuf>) -> Config {
         permission_timeout: Duration::from_secs(2),
         sessions_dir,
         compaction: Default::default(),
+        subagents: Default::default(),
     }
 }
 

@@ -1272,6 +1272,16 @@ pub async fn serve_with(
         .map_err(|error| anyhow::anyhow!("ACP connection failed: {error}"))
 }
 
+/// Serve with an EXPLICIT config: the subagent path, which pre-filters
+/// the MCP registry (`filter_for_subagent`) before this call.
+pub async fn serve_with_config(config: crate::config::Config) -> anyhow::Result<()> {
+    let builder = agent_builder_with_config(config, LlmClient::new).await?;
+    builder
+        .connect_to(Stdio::new())
+        .await
+        .map_err(|error| anyhow::anyhow!("ACP connection failed: {error}"))
+}
+
 /// `serve --listen <addr>` (ADR 0010): ACP over HTTP/1.1 + WebSocket on
 /// `/acp` via the official `agent-client-protocol-http` server stack. No
 /// flag = stdio (the FIXED contract); the listener is additive. Each

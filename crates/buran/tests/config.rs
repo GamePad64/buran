@@ -348,3 +348,81 @@ api_key_env = "CHEAP_KEY"
     assert_eq!(s.model, "cheap-model");
     assert_eq!(s.api_key_env, "CHEAP_KEY");
 }
+
+#[test]
+fn subagents_section_parse_and_defaults() {
+    // Absent: defaults with enabled=false (opt-in server).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://x/v1\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    let s = &cfg.subagents;
+    assert!(!s.enabled, "absent section = disabled (opt-in)");
+    assert_eq!(s.max_children, 4);
+    assert_eq!(s.timeout_secs, 600);
+    assert!(s.provider.is_none(), "no override = inherit");
+
+    // Present: fields parse.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[subagents]
+enabled = true
+max_children = 2
+timeout_secs = 120
+[subagents.provider]
+base_url = "http://cheap.local/v1"
+model = "cheap-model"
+api_key_env = "CHEAP_KEY"
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    let s = &cfg.subagents;
+    assert!(s.enabled);
+    assert_eq!(s.max_children, 2);
+    assert_eq!(s.timeout_secs, 120);
+    let p = s.provider.as_ref().expect("override parsed");
+    assert_eq!(p.model, "cheap-model");
+}
+
+#[test]
+fn filter_for_subagent_drops_the_subagents_entry_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[[mcp_servers]]
+name = "subagents"
+command = "buran"
+args = ["subagents"]
+[[mcp_servers]]
+name = "fs"
+command = "/bin/true"
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert_eq!(cfg.mcp_servers.len(), 2);
+
+    let filtered = buran::config::filter_for_subagent(cfg);
+    assert_eq!(
+        filtered
+            .mcp_servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fs"],
+        "the subagents entry is dropped (depth ≤ 2, mechanically)"
+    );
+}

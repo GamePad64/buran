@@ -14,6 +14,7 @@ pub fn serve(
     resume: Option<String>,
     fork: Option<String>,
     listen: Option<std::net::SocketAddr>,
+    subagent: bool,
 ) -> Result<()> {
     if listen.is_some() && (resume.is_some() || fork.is_some()) {
         anyhow::bail!(
@@ -67,13 +68,30 @@ pub fn serve(
             target
         }
     } else {
-        return crate::acp::serve();
+        return serve_stdio(subagent);
     };
     // Fail fast on an unknown id, before stdout becomes the ACP channel.
     store
         .open(&effective)
         .map_err(|e| anyhow::anyhow!("{e} (see buran sessions list)"))?;
     eprintln!("resuming session {effective}: connect a client and load it via session/loadSession");
+    serve_stdio(subagent)
+}
+
+/// The stdio ACP server entry. `subagent` mode filters the `subagents`
+/// entry from the MCP registry (depth ≤ 2) and marks the transcript.
+fn serve_stdio(subagent: bool) -> Result<()> {
+    if subagent {
+        let project = std::env::current_dir().ok();
+        let config = crate::config::Config::load(project.as_deref(), |v| std::env::var(v).ok())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(crate::acp::serve_with_config(
+            crate::config::filter_for_subagent(config),
+        ));
+    }
     crate::acp::serve()
 }
 
