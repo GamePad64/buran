@@ -109,6 +109,17 @@ Resume semantics: `serve` validates the id before the ACP channel opens; a clien
 
 Compaction: `/compact [instructions]` summarizes the older half of the conversation into a summary; the LLM window becomes summary + kept tail instead of the full history. **Auto-compaction is on by default** (ADR 0006): after a turn, when the window estimate crosses `context_window − reserve` (default window 128k, reserve 8k), the same compaction runs silently and the client sees a `[auto-compacted N messages]` note. Set `[compaction] auto = false` to require the manual command.
 
+Summaries can use a cheaper model — the Aider pattern:
+
+```toml
+[compaction.summarizer]
+base_url = "http://cheap.local/v1"
+model = "cheap-model"
+api_key_env = "CHEAP_KEY"
+```
+
+When a turn is cut by the provider's context limit (`finish_reason: length` with no tool calls — the model truncated mid-prose), buran recovers: one aggressive compaction (keeping 25% of the window) and one retry of the same prompt. A second cut is final — no recovery loops.
+
 ## ACP contract
 
 `buran serve` speaks ACP over stdio (`initialize` → `newSession` → `prompt` → streamed `session/update`, with `session/request_permission` for tool calls). Clients declare their capabilities at `initialize`; a client without fs capability simply gets a catalog without fs tools — honest degradation, no crash, no bundled fallback.
