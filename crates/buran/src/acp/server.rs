@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::compact::summarizer::Summarizer as _;
 use crate::config::{Config, PermissionPolicy, ProviderConfig};
-use crate::llm::loop_::{AgentLoop, PermissionDecision, SessionState, TurnEvent};
+use crate::llm::loop_::{AgentLoop, PermissionDecision, SessionState, TurnEvent, TurnSummary};
 use crate::llm::types::FinishReason;
 use crate::llm::{LlmClient, LlmError};
 use crate::mcp::McpManager;
@@ -707,6 +707,7 @@ async fn run_prompt_turn(
             .await;
     }
 
+    let retry_text = text.clone();
     // History length BEFORE `mem::take`, under the same lock: everything
     // the turn appends past this mark belongs to this turn's transcript
     // slice (persisted in the guard block below).
@@ -777,7 +778,8 @@ async fn run_prompt_turn(
             // Usage record (hardening v1.5.1): one line per completed turn,
             // after the turn's messages so the transcript reads in order.
             // Degrades like the message appends above.
-            if let (Some(writer), Ok((_, Some(usage)))) = (&handle.store_file, result.as_ref())
+            if let (Some(writer), Ok((_, Some(summary)))) = (&handle.store_file, result.as_ref())
+                && let Some(usage) = &summary.usage
                 && let Err(e) = writer.append(&crate::session::TranscriptRecord::Usage {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
@@ -788,6 +790,65 @@ async fn run_prompt_turn(
             }
         }
     }
+
+    // Overflow recovery (ADR 0006): a turn cut by `finish_reason: length`
+    // with NO tool calls means the model was truncated mid-prose — the
+    // window really is too full. ONE aggressive compaction (keep 25% of
+    // the window) and ONE retry of the same prompt; the retry's result
+    // replaces the first as the turn outcome. If the retry ALSO ends
+    // Length, it stands as-is — MaxTokens to the client, no loops.
+    // `MaxTokens` + Length + no tool calls: the model was truncated
+    // mid-prose. Usage may be absent (endpoints skip it on cuts), so the
+    // Option is matched loosely.
+    let overflow = matches!(
+        &result,
+        Ok((StopReason::MaxTokens, Some(summary)))
+            if summary.finish == FinishReason::Length && summary.tool_calls_made == 0
+    ) || matches!(&result, Ok((StopReason::MaxTokens, None)));
+    let result = if overflow {
+        tracing::info!("turn ended Length with no tool calls — compact-and-retry");
+        // Pop the failed pass's tail BEFORE compacting: the retry's loop
+        // would re-push the same user line, and a boundary computed over
+        // the tail would point past the shortened history once the tail
+        // is gone (the projection ignores such a point entirely — the
+        // summary note would vanish from the retry's window).
+        {
+            let mut sessions = state.sessions.lock().expect("sessions lock");
+            if let Some(handle) = sessions.get_mut(&req.session_id) {
+                handle.session.history.pop(); // truncated assistant
+                handle.session.history.pop(); // user prompt line
+            }
+        }
+        match run_auto_compact_keep(state, provider, &req.session_id, 4).await {
+            Ok(messages) => {
+                let _ = conn.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new(format!(
+                            "[auto-compacted {messages} messages before retry]"
+                        )),
+                    ))),
+                ));
+                match build_turn_context(state, &req.session_id, retry_text.clone()) {
+                    Ok(turn) => run_prompt_turn_inner(state, provider, req, conn, turn).await,
+                    Err(error) => {
+                        // The session was popped (2 lines); on a context
+                        // build failure the turn fails honestly — the
+                        // compaction boundary keeps history valid.
+                        Err(anyhow::anyhow!("retry context build failed: {error}"))
+                    }
+                }
+            }
+            Err(error) => {
+                // Recovery failed: the first result stands (MaxTokens to
+                // the client), the note explains why nothing changed.
+                tracing::warn!(%error, "overflow recovery compaction failed");
+                result
+            }
+        }
+    } else {
+        result
+    };
 
     // Auto-compaction (ADR 0006 trigger policy): after the turn is fully
     // persisted and the guard cleared, the estimated window may cross
@@ -845,15 +906,14 @@ fn summarizer_for(
     Ok(crate::compact::summarizer::BuiltinSummarizer::new(llm))
 }
 
-/// One silent compaction pass for the auto path: take the session out,
-/// cut keeping HALF the current window (auto keeps more than manual —
-/// the goal is fitting the budget, not shrinking hard), summarize,
-/// record. Returns the compacted message count.
-async fn run_auto_compact(
+/// The auto compaction with an explicit keep divisor: `/2` for the
+/// threshold path, `/4` (keep 25%) for overflow recovery — the window
+/// is provably too full, so recover harder.
+async fn run_auto_compact_keep(
     state: &ServerState,
     provider: &ProviderConfig,
     session_id: &SessionId,
-    _conn: &ConnectionTo<AcpClient>,
+    keep_divisor: usize,
 ) -> anyhow::Result<usize> {
     let summarizer = summarizer_for(state, provider)?;
     let (mut session, writer) = {
@@ -867,7 +927,7 @@ async fn run_auto_compact(
         )
     };
     let outcome = async {
-        let keep = window_estimate(&session) / 2;
+        let keep = window_estimate(&session) / keep_divisor;
         let (messages, _summary) =
             compact_session_once(&mut session, writer.as_ref(), &summarizer, keep, None).await?;
         Ok::<usize, anyhow::Error>(messages)
@@ -882,6 +942,19 @@ async fn run_auto_compact(
     outcome
 }
 
+/// One silent compaction pass for the auto path: take the session out,
+/// cut keeping HALF the current window (auto keeps more than manual —
+/// the goal is fitting the budget, not shrinking hard), summarize,
+/// record. Returns the compacted message count.
+async fn run_auto_compact(
+    state: &ServerState,
+    provider: &ProviderConfig,
+    session_id: &SessionId,
+    _conn: &ConnectionTo<AcpClient>,
+) -> anyhow::Result<usize> {
+    run_auto_compact_keep(state, provider, session_id, 2).await
+}
+
 /// Everything a turn body needs from its session, taken under the sessions
 /// lock and handed back after the turn resolves.
 struct TurnContext {
@@ -892,6 +965,27 @@ struct TurnContext {
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+/// Builds a TurnContext for the overflow-retry path: the failed pass's
+/// tail (its user line + truncated assistant) was popped, so the retry
+/// re-submits the SAME user text through the loop's normal push.
+fn build_turn_context(
+    state: &ServerState,
+    session_id: &SessionId,
+    text: String,
+) -> anyhow::Result<TurnContext> {
+    let mut sessions = state.sessions.lock().expect("sessions lock");
+    let handle = sessions
+        .get_mut(session_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown session {}", session_id.0))?;
+    Ok(TurnContext {
+        text,
+        session: std::mem::take(&mut handle.session),
+        system_prompt: handle.system_prompt.clone(),
+        skills: handle.skills.clone(),
+        cancel_rx: handle.cancel_tx.subscribe(),
+    })
+}
+
 /// The turn body, split out so `run_prompt_turn` can own the guard's
 /// set/clear around it.
 async fn run_prompt_turn_inner(
@@ -900,7 +994,7 @@ async fn run_prompt_turn_inner(
     req: &PromptRequest,
     conn: &ConnectionTo<AcpClient>,
     turn: TurnContext,
-) -> anyhow::Result<(StopReason, Option<crate::llm::types::Usage>)> {
+) -> anyhow::Result<(StopReason, Option<TurnSummary>)> {
     let TurnContext {
         text,
         mut session,
@@ -1050,7 +1144,7 @@ async fn run_prompt_turn_inner(
             FinishReason::LoopGuard => StopReason::EndTurn,
         }
     };
-    Ok((stop, summary.usage))
+    Ok((stop, Some(summary)))
 }
 
 /// Monotonic message id for one turn's text chunks: all chunks of one

@@ -69,3 +69,19 @@ fn record_meta() -> TranscriptMeta {
         forked_from: None,
     }
 }
+
+#[test]
+fn debug_chunk_parse() {
+    let frame = r#"{"choices":[{"delta":{"content":"partial prose"}},{"delta":{},"finish_reason":"length"}]}"#;
+    let chunk: Result<buran::llm::types::ChatChunk, _> = serde_json::from_str(frame);
+    match chunk {
+        Ok(c) => println!(
+            "CHOICES: {:?}",
+            c.choices
+                .iter()
+                .map(|x| x.finish_reason)
+                .collect::<Vec<_>>()
+        ),
+        Err(e) => println!("PARSE ERR: {e}"),
+    }
+}

@@ -448,3 +448,99 @@ async fn compaction_summarizer_section_routes_summary_to_the_alternate_provider(
         summary_uri
     );
 }
+
+/// Overflow recovery (ADR 0006): a turn that ends `finish_reason: length`
+/// with NO tool calls (the model was cut off mid-prose) triggers ONE
+/// aggressive compaction (keep 25%) and ONE retry of the same prompt.
+/// A second failure is final — no loops.
+#[tokio::test(flavor = "current_thread")]
+async fn length_turn_recovers_with_one_compact_and_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    // Round 1: turn 1 answers normally (seeds the history).
+    let seed = format!("data: {}\n\n{}", text_chunk("seed answer"), stop_and_done());
+    // Round 2: cut off mid-prose (length, no tool calls).
+    let cut_off = "data: {\"choices\":[{\"delta\":{\"content\":\"partial prose\"}},{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+    // Round 3: the recovery compaction summary.
+    let summary = format!(
+        "data: {}\n\n{}",
+        text_chunk("RECOVERY SUMMARY"),
+        stop_and_done()
+    );
+    // Round 4: the retry answers normally.
+    let retry = format!(
+        "data: {}\n\n{}",
+        text_chunk("retry answer"),
+        stop_and_done()
+    );
+    m.push_response_frames(sse(vec![Box::leak(seed.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(cut_off.into())]));
+    m.push_response_frames(sse(vec![Box::leak(summary.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(retry.into_boxed_str())]));
+    let m2 = m.clone();
+
+    let config = test_config(Some(dir.path().to_path_buf()));
+    let agent =
+        buran::acp::agent_builder_with_config(config, move |p: &buran::config::ProviderConfig| {
+            Ok(LlmClient::with_transport(
+                p.clone(),
+                Http::builder(m2.clone()).build().unwrap(),
+            ))
+        })
+        .await
+        .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } = cx
+            .build_session(std::env::current_dir().unwrap())
+            .block_task()
+            .start_session()
+            .await?;
+
+        // Turn 1 fills the history (normal stop).
+        session.send_prompt("seed the history")?;
+        let _ = drain_to_response(&mut session).await?;
+        // Turn 2 hits length → recovery → retry; the client sees the
+        // retry's answer.
+        session.send_prompt("ask that overflows")?;
+        let text = drain_to_response(&mut session).await?;
+        assert!(
+            text.contains("retry answer"),
+            "the client sees the RETRY's answer: {text}"
+        );
+        assert!(
+            text.contains("auto-compacted") || text.contains("compact"),
+            "and a compaction note: {text}"
+        );
+        Ok(())
+    });
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("timed out")
+        .expect("connection failed");
+
+    let requests = m.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "seed turn + overflow turn + compaction + retry = 4 LLM rounds"
+    );
+    // The retry request must carry the recovery summary, not the span.
+    assert!(
+        body_contains(&requests[3], "RECOVERY SUMMARY"),
+        "retry rides the compacted window"
+    );
+    // The transcript records the recovery compaction.
+    let mut found = false;
+    for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".jsonl")
+            && let Ok(text) = std::fs::read_to_string(entry.path())
+            && text.contains("RECOVERY SUMMARY")
+        {
+            found = true;
+        }
+    }
+    assert!(found, "the recovery compaction persisted");
+}
