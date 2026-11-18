@@ -67,6 +67,7 @@ fn record_meta() -> TranscriptMeta {
         ended_at: None,
         cwd: std::path::PathBuf::from("/tmp/proj"),
         forked_from: None,
+        subagent_of: None,
     }
 }
 

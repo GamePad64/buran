@@ -18,6 +18,7 @@ fn meta(cwd: &str) -> TranscriptMeta {
         ended_at: None,
         cwd: cwd.into(),
         forked_from: None,
+        subagent_of: None,
     }
 }
 
@@ -117,4 +118,49 @@ fn title_falls_back_to_nothing_when_only_corrupt_body() {
     std::fs::write(&path, text).unwrap();
     let infos = store.list().unwrap();
     assert_eq!(infos[0].title, None, "damage yields no title, not an error");
+}
+
+#[test]
+fn subagent_of_marker_flows_through_head_list_and_old_files() {
+    // A child transcript head carries subagent_of; list surfaces it.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let mut child_meta = meta("/w");
+    child_meta.subagent_of = Some("parent-1234".into());
+    store.create(child_meta).unwrap();
+
+    let infos = store.list().unwrap();
+    assert_eq!(
+        infos[0].subagent_of.as_deref(),
+        Some("parent-1234"),
+        "the marker reaches the catalog"
+    );
+
+    // A normal session has no marker; the child row keeps its own.
+    store.create(meta("/w")).unwrap();
+    let infos = store.list().unwrap();
+    let normal = infos
+        .iter()
+        .find(|i| i.subagent_of.is_none())
+        .expect("normal row");
+    assert!(normal.title.is_none(), "the normal row is the empty one");
+    let child = infos
+        .iter()
+        .find(|i| i.subagent_of.is_some())
+        .expect("child row");
+    assert_eq!(child.subagent_of.as_deref(), Some("parent-1234"));
+
+    // A PRE-v2 transcript (no field) loads fine: serde default.
+    let legacy = dir
+        .path()
+        .join("01940000-0000-7000-8000-000000000099.jsonl");
+    std::fs::write(
+        &legacy,
+        r#"{"type":"metadata","model":"m","provider":"p","started_at":"2026-11-18T00:00:00Z","ended_at":null,"cwd":"/w"}"#,
+    )
+    .unwrap();
+    let store2 = Store::new(dir.path());
+    let infos = store2.list().unwrap();
+    let legacy_row = infos.iter().find(|i| i.id.ends_with("099")).unwrap();
+    assert_eq!(legacy_row.subagent_of, None, "old head parses, no marker");
 }

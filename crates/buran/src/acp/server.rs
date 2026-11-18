@@ -250,6 +250,7 @@ fn build_agent(
                             ended_at: None,
                             cwd: req.cwd.clone(),
                             forked_from: None,
+                            subagent_of: None, // the child marks itself via --subagent-of (Task 3)
                         }) {
                         Ok(f) => Some(f),
                         Err(e) => {

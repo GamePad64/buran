@@ -13,6 +13,7 @@ fn meta(cwd: &str) -> TranscriptMeta {
         ended_at: None,
         cwd: cwd.into(),
         forked_from: None,
+        subagent_of: None,
     }
 }
 

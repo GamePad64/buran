@@ -48,4 +48,10 @@ pub struct TranscriptMeta {
     /// Session this one forked from, when `--fork` created it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Parent session id when this transcript belongs to a SUBAGENT
+    /// (ADR 0011): `--subagent` children mark themselves so the catalog
+    /// can show/filter delegation sessions. Absent on normal sessions;
+    /// serde defaults keep pre-v2 heads wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_of: Option<String>,
 }

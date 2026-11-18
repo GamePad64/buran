@@ -52,6 +52,7 @@ pub fn serve(
                     ended_at: None,
                     cwd: source_head.cwd,
                     forked_from: None, // store.fork sets the lineage
+                    subagent_of: None,
                 },
             )
             .map_err(|e| anyhow::anyhow!("{e} (see buran sessions list)"))?;
@@ -109,10 +110,18 @@ pub fn sessions_list() -> Result<()> {
     // whole sort. `(empty)` marks a session with no user message yet —
     // a blank title column would look like a formatting bug.
     for i in infos.iter().rev() {
+        // `[subagent]` marks delegation transcripts (ADR 0011): they are
+        // catalog-visible for debugging but visually separable.
+        let marker = if i.subagent_of.is_some() {
+            "[subagent] "
+        } else {
+            ""
+        };
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}{}\t{}\t{}",
             i.id,
             i.meta.started_at,
+            marker,
             i.title.as_deref().unwrap_or("(empty)"),
             i.meta.cwd.display(),
             i.meta.forked_from.as_deref().unwrap_or("-")

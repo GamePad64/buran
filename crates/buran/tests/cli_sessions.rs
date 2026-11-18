@@ -240,3 +240,24 @@ fn serve_resume_unknown_id_fails_fast() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn sessions_list_marks_subagent_transcripts() {
+    let home = tempfile::tempdir().unwrap();
+    let store_root = home.path().join(".local/state/buran/sessions");
+    std::fs::create_dir_all(&store_root).unwrap();
+    std::fs::write(
+        store_root.join("01940000-0000-7000-8000-000000000005.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "metadata", "model": "m", "provider": "p",
+                "started_at": "2026-11-18T00:00:00Z", "ended_at": null,
+                "cwd": "/w", "subagent_of": "01940000-0000-7000-8000-000000000001"
+            })
+        ),
+    )
+    .unwrap();
+    let out = run_buran_with_home(home.path(), &["sessions", "list"]);
+    assert!(out.contains("[subagent]"), "child rows are marked: {out}");
+}

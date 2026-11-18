@@ -31,6 +31,9 @@ pub struct SessionInfo {
     /// `list` scans a bounded head prefix — the title must not cost a
     /// full replay of every transcript in the catalog.
     pub title: Option<String>,
+    /// Parent session id for subagent transcripts (ADR 0011); `None` on
+    /// normal sessions. Straight from the head metadata.
+    pub subagent_of: Option<String>,
 }
 
 /// Longest title `list` carries; the ellipsis is part of the count.
@@ -158,6 +161,7 @@ impl Store {
             let title = replay::first_user_title(&entry.path(), TITLE_MAX_CHARS);
             out.push(SessionInfo {
                 id: stem.to_string(),
+                subagent_of: head.subagent_of.clone(),
                 meta: head,
                 title,
             });
