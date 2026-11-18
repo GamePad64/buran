@@ -92,6 +92,22 @@ Project instructions, read automatically (the way Claude Code reads CLAUDE.md). 
 
 On first run, `buran doctor` detects an empty MCP configuration and offers **ACT** (MCP-over-stdio) as the ready-made tool set — including its filesystem component, which is the way buran gets file tools (there is no bundled fs server; all tools are external, by design). The offer prints the ready-to-paste config line; the harness itself has no ACT-specific code.
 
+## Subagents (v2, opt-in)
+
+Delegate subtasks to parallel buran agents — via a bundled MCP server, no harness magic:
+
+```json
+{ "mcpServers": { "subagents": { "command": "buran", "args": ["subagents"] } } }
+```
+
+```toml
+[subagents]
+enabled = true
+max_children = 4        # optional; provider override available too
+```
+
+The model gets two tools: **spawn** (start a child `buran serve --subagent` on a subtask, returns an id) and **wait** (collect the child's final text). Children inherit the parent's provider, MCP servers, and skills; `[subagents].provider` overrides the model. Depth ≤ 2 is mechanical — a child's config has the `subagents` entry filtered out. Child transcripts are marked `subagent_of` and show as `[subagent]` in `buran sessions list`. Children run tool calls with `allow_all` (v2); see ADR 0011.
+
 ## Sessions
 
 Every conversation persists as an append-only JSONL transcript in `~/.local/state/buran/sessions/`, named by its UUIDv7 id (filename order = chronological order; ADR 0007: the directory listing is the catalog — no index, no SQLite).
