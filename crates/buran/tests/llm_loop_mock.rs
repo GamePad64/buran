@@ -11,6 +11,7 @@ use buran::llm::LlmClient;
 use buran::llm::loop_::{AgentLoop, PermissionDecision, SessionState, ToolCaller, TurnEvent};
 use buran::llm::types::{FinishReason, Role};
 use buran::mcp::{McpError, ToolOutput};
+use hclient::mock::MockTransport;
 
 fn provider() -> ProviderConfig {
     ProviderConfig {
@@ -488,4 +489,112 @@ async fn streak_guard_ignores_tool_calls_with_differing_args() {
         10,
         "alternating-arg rounds must all execute; only the 5th identical round is cut"
     );
+}
+
+mod hooks_tests {
+    //! `post_tool_use` hook wiring (ADR 0012): the tool result the hook
+    //! rewrites is what enters history AND the next LLM request; a broken
+    //! hook fails open with the original.
+
+    use super::*;
+    use buran::llm::loop_::{PermissionDecision, SessionState, TurnEvent};
+
+    fn tool_call_frame() -> &'static str {
+        concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"fs__read","arguments":"{}"}}]}},{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    async fn hooked_turn(hook_command: &str, tool_result: &str) -> (Vec<String>, String) {
+        // Mock LLM: round 1 = tool call; round 2 = plain answer.
+        let m = MockTransport::new();
+        let frames1 = format!("data: {}\n\n{}", text_chunk(""), tool_call_frame());
+        let frames2 = format!(
+            "data: {}\n\n{}",
+            text_chunk("done answering"),
+            stop_chunk("done answering")
+        );
+        m.push_response_frames(sse(vec![Box::leak(frames1.into_boxed_str())]));
+        m.push_response_frames(sse(vec![Box::leak(frames2.into_boxed_str())]));
+        let m2 = m.clone();
+
+        let caller = StubCaller {
+            real_calls: AtomicUsize::new(0),
+        };
+        // The hook: a real `sh -c` process that appends a marker to the
+        // JSON result field it receives on stdin.
+        let hook_script = format!(r#"sed 's/{tool_result}/&-HOOKED/'"#);
+        let _ = hook_script;
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let answerer = tokio::spawn(async move {
+            while let Some(ev) = events_rx.recv().await {
+                if let TurnEvent::PermissionQuery(_) = &ev {
+                    let _ = perm_tx.send(PermissionDecision::Allow).await;
+                }
+            }
+        });
+
+        // Catalog entry matching the scripted tool call (wire name fs__read).
+        let entry = buran::mcp::ToolEntry {
+            server: "fs".into(),
+            tool: buran::mcp::McpTool::new("read", "read a file", serde_json::Map::new()),
+        };
+        // The hook: a real `sh -c` process rewriting the JSON "result"
+        // field — exactly the contract the loop consumes.
+        // serde_json emits no spaces after colons — the sed must match
+        // the wire shape exactly. "none" disables the hook (fail-open path).
+        let hook = if hook_command == "none" {
+            None
+        } else {
+            Some(r#"sed 's/"result":"file body"/"result":"file body-HOOKED"/'"#.to_string())
+        };
+        let loop_ = AgentLoop::new(
+            LlmClient::with_transport(
+                provider(),
+                hclient::Client::builder(m2.clone()).build().unwrap(),
+            ),
+            Arc::new(caller),
+            "be helpful".to_string(),
+        )
+        .with_catalog(&buran::mcp::ToolCatalog::new(vec![entry]))
+        .with_post_tool_use(hook);
+        let mut session = SessionState::default();
+        let _summary = loop_
+            .run_turn(&mut session, "use the tool", events_tx, perm_rx, cancel_rx)
+            .await
+            .unwrap();
+        answerer.abort();
+
+        // The tool result + hook outcome live in session history; the
+        // next request body is captured by the mock.
+        let requests = m.requests();
+        let last_body = requests
+            .last()
+            .and_then(|r| r.body.text().map(|s| s.to_string()))
+            .unwrap_or_default();
+        (vec![], last_body)
+    }
+
+    #[tokio::test]
+    async fn rewritten_result_reaches_the_next_request() {
+        let (_, body) = hooked_turn("sed", "file body").await;
+        assert!(
+            body.contains("-HOOKED"),
+            "the hook-rewritten result rides the next request: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_hook_fails_open_with_the_original() {
+        let (_, body) = hooked_turn("none", "file body").await;
+        assert!(
+            body.contains("file body"),
+            "fail-open keeps the original: {body}"
+        );
+        assert!(!body.contains("-HOOKED"), "no rewrite happened: {body}");
+    }
 }

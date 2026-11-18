@@ -188,6 +188,9 @@ pub struct AgentLoop {
     /// Scanned skill descriptions; `<skill>Name</skill>` at the head of
     /// the turn's first assistant message loads the matching body
     /// (ADR 0004 — zero tools, the model just writes the tag).
+    /// `post_tool_use` hook command (ADR 0012): may rewrite tool results
+    /// before they enter history. `None` = disabled.
+    post_tool_use: Option<String>,
     skills: Vec<crate::skills::SkillDescription>,
 }
 
@@ -197,6 +200,7 @@ impl AgentLoop {
             llm,
             tools,
             system,
+            post_tool_use: None,
             tool_defs: Vec::new(),
             tool_map: BTreeMap::new(),
             max_turns: 32,
@@ -246,6 +250,14 @@ impl AgentLoop {
     /// turn is cut with a system note in history.
     pub fn with_same_tool_streak_guard(mut self, n: u32) -> Self {
         self.same_tool_streak_guard = Some(n);
+        self
+    }
+
+    /// Sets the `post_tool_use` hook command (ADR 0012): run after each
+    /// tool result; a valid `{"result": ...}` response replaces the
+    /// result. `None` = disabled (fail-open everywhere).
+    pub fn with_post_tool_use(mut self, command: Option<String>) -> Self {
+        self.post_tool_use = command;
         self
     }
 
@@ -436,7 +448,44 @@ impl AgentLoop {
                                 output: output.clone(),
                             })
                             .await;
-                        ChatMessage::tool(call.id.clone(), output.text)
+                        // `post_tool_use` hook (ADR 0012): the rewritten
+                        // result is what enters history AND the transcript
+                        // — the model never sees the original. Fail-open:
+                        // spawn failure, timeout, or a response without a
+                        // valid "result" field keeps the original. The
+                        // hook is I/O (ADR 0001 exception: it runs in the
+                        // spawned turn task, never on the dispatch loop).
+                        let final_text = if let Some(command) = &self.post_tool_use {
+                            let event = serde_json::json!({
+                                "event": "post_tool_use",
+                                "tool": call.function.name,
+                                "arguments": call.function.arguments,
+                                "result": output.text,
+                                "is_error": output.is_error,
+                            });
+                            match crate::hooks::run_hook(
+                                command,
+                                &event,
+                                std::time::Duration::from_secs(10),
+                            ) {
+                                Some(out) => {
+                                    match serde_json::from_str::<serde_json::Value>(&out) {
+                                        Ok(v) => v
+                                            .get("result")
+                                            .and_then(|r| r.as_str())
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| output.text),
+                                        // Not JSON (plain text echo): treat the
+                                        // whole output as the rewritten result.
+                                        Err(_) => out,
+                                    }
+                                }
+                                None => output.text,
+                            }
+                        } else {
+                            output.text
+                        };
+                        ChatMessage::tool(call.id.clone(), final_text)
                     }
                 };
                 session.history.push(tool_message);
