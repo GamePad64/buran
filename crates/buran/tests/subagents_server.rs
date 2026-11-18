@@ -13,16 +13,15 @@ struct McpProc {
     child: Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
-    // Kept alive for the child's lifetime: the config HOME the server reads.
-    _home: tempfile::TempDir,
+    // The config HOME must outlive the child process: dropping the
+    // TempDir deletes the config mid-session (the classic opt-in trap).
+    // Never read directly; held for its Drop.
+    #[allow(dead_code)]
+    home: tempfile::TempDir,
 }
 
 impl McpProc {
     fn spawn(args: &[&str]) -> Self {
-        // HOME points at a tempdir whose config enables subagents: the
-        // server is opt-in by design, and the test is the opt-in. The
-        // TempDir is held in the struct — dropping it mid-session would
-        // delete the config under the running server.
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".config/buran")).unwrap();
         std::fs::write(
@@ -30,9 +29,14 @@ impl McpProc {
             "[subagents]\nenabled = true\n",
         )
         .unwrap();
+        let path = home.path().to_path_buf();
+        Self::spawn_home(args, &path, home)
+    }
+
+    fn spawn_home(args: &[&str], home: &std::path::Path, held: tempfile::TempDir) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_buran"))
             .args(args)
-            .env("HOME", home.path())
+            .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -44,7 +48,7 @@ impl McpProc {
             child,
             stdin,
             stdout,
-            _home: home,
+            home: held,
         }
     }
 
@@ -191,5 +195,160 @@ fn wait_unknown_id_errors_and_wait_timeout_reports_status() {
     assert!(
         text.contains("timeout") || text.contains("failed"),
         "an unreachable-provider child ends in timeout or failure, honestly: {text}"
+    );
+}
+
+/// The text-level double: a loopback SSE endpoint the CHILD talks to
+/// (the child is a separate process; hclient-mock cannot inject into it).
+/// Test-only, labeled — production code never spawns HTTP.
+mod stub {
+    pub async fn serve_llm(answer: &'static str) -> std::net::SocketAddr {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answer = Arc::new(answer.to_string());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    // Count LLM rounds so every request gets a fresh answer.
+                    // Simplest honest double: always the same completion.
+                    let body = format!(
+                        r#"{{"choices":[{{"delta":{{"content":"{answer}"}}}},{{"delta":{{}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
+                    );
+                    let sse = format!(
+                        "data: {body}\n\ndata: {{\"choices\":[{{\"delta\":{{}}}}]}}\n\ndata: [DONE]\n\n"
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+}
+
+#[test]
+fn e2e_spawn_wait_returns_the_child_final_text_and_marks_the_transcript() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let addr = rt.block_on(stub::serve_llm("SUBAGENT FINAL TEXT"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/buran")).unwrap();
+    std::fs::write(
+        home.path().join(".config/buran/config.toml"),
+        format!(
+            "[subagents]\nenabled = true\n\n[provider]\nbase_url = \"http://{addr}/v1\"\nmodel = \"stub-model\"\napi_key = \"x\"\n"
+        ),
+    )
+    .unwrap();
+
+    let home_path = home.path().to_path_buf();
+    // The parent-serve normally exports this at newSession time (one
+    // process per session); the test stands in for the parent.
+    // SAFETY: test process, no concurrent env readers.
+    unsafe {
+        std::env::set_var("BURAN_SESSION_ID", "parent-session-0001");
+    }
+    let mut proc = McpProc::spawn_home(&["subagents"], &home_path, home);
+    init(&mut proc);
+
+    let resp = proc.request(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "spawn",
+            "arguments": {"prompt": "say the phrase", "cwd": dir.path().to_string_lossy()}
+        }),
+    );
+    let spawn_text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("spawn text");
+    let parsed: serde_json::Value = serde_json::from_str(spawn_text).expect("spawn JSON");
+    let agent_id = parsed["agent_id"].as_str().expect("agent_id").to_string();
+
+    let resp = proc.request(
+        3,
+        "tools/call",
+        serde_json::json!({"name": "wait", "arguments": {"agent_id": agent_id, "timeout_secs": 20}}),
+    );
+    let wait_text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("wait text");
+    eprintln!("WAIT_TEXT: {wait_text}");
+    assert!(
+        wait_text.contains("SUBAGENT FINAL TEXT"),
+        "wait returns the child's final text: {wait_text}"
+    );
+    assert!(wait_text.contains("\"done\""), "status done: {wait_text}");
+
+    // The child transcript is marked subagent_of (its parent id is the
+    // CHILD's own session id chain — here: the marker exists at all).
+    let store_root = home_path.join(".local/state/buran/sessions");
+    let entries = std::fs::read_dir(&store_root).expect("store exists");
+    let mut found = false;
+    for e in entries.flatten() {
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        if text.contains("subagent_of") {
+            found = true;
+        }
+    }
+    assert!(found, "a child transcript carries the subagent_of marker");
+
+    drop(proc); // cleanup: kills children
+}
+
+#[test]
+fn spawn_enforces_max_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/buran")).unwrap();
+    std::fs::write(
+        home.path().join(".config/buran/config.toml"),
+        "[subagents]\nenabled = true\nmax_children = 2\n\n[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"unused\"\napi_key = \"x\"\n",
+    )
+    .unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let mut proc = McpProc::spawn_home(&["subagents"], &home_path, home);
+    init(&mut proc);
+
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let resp = proc.request(
+            10 + i,
+            "tools/call",
+            serde_json::json!({
+                "name": "spawn",
+                "arguments": {"prompt": "w", "cwd": dir.path().to_string_lossy()}
+            }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(text).expect("spawn JSON");
+        ids.push(parsed["agent_id"].as_str().expect("id").to_string());
+    }
+
+    // Third spawn at the cap of 2: refused with the live count.
+    let resp = proc.request(
+        12,
+        "tools/call",
+        serde_json::json!({
+            "name": "spawn",
+            "arguments": {"prompt": "w", "cwd": dir.path().to_string_lossy()}
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("spawn refused") && text.contains("2"),
+        "the cap names itself: {text}"
     );
 }

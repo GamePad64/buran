@@ -42,6 +42,10 @@ enum Command {
         /// not by humans.
         #[arg(long)]
         subagent: bool,
+        /// Parent session id for `subagent_of` marking (ADR 0011). Set
+        /// by `buran subagents` alongside --subagent, not by humans.
+        #[arg(long)]
+        subagent_of: Option<String>,
     },
     /// Probe config and MCP servers, offer ACT on first run
     Doctor,
@@ -81,13 +85,15 @@ fn main() -> anyhow::Result<()> {
         fork: None,
         listen: None,
         subagent: false,
+        subagent_of: None,
     }) {
         Command::Serve {
             resume,
             fork,
             listen,
             subagent,
-        } => buran::run::serve(resume, fork, listen, subagent),
+            subagent_of,
+        } => buran::run::serve(resume, fork, listen, subagent, subagent_of),
         Command::Doctor => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

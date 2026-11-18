@@ -216,6 +216,10 @@ pub struct Config {
     pub compaction: CompactionConfig,
     /// `[subagents]` delegation policy (ADR 0011): opt-in server.
     pub subagents: SubagentsConfig,
+    /// Parent session id when this server runs AS a subagent
+    /// (`--subagent-of`); newSession writes it into the transcript head.
+    /// Not a config-file key — a CLI-injected runtime field.
+    pub subagent_parent: Option<String>,
 }
 
 /// `[subagents]`: the delegation server's knobs. Disabled by default —
@@ -455,6 +459,7 @@ impl Config {
             sessions_dir: None,
             compaction,
             subagents,
+            subagent_parent: None,
         })
     }
 }

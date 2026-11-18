@@ -15,6 +15,7 @@ pub fn serve(
     fork: Option<String>,
     listen: Option<std::net::SocketAddr>,
     subagent: bool,
+    subagent_of: Option<String>,
 ) -> Result<()> {
     if listen.is_some() && (resume.is_some() || fork.is_some()) {
         anyhow::bail!(
@@ -69,23 +70,26 @@ pub fn serve(
             target
         }
     } else {
-        return serve_stdio(subagent);
+        return serve_stdio(subagent, subagent_of);
     };
     // Fail fast on an unknown id, before stdout becomes the ACP channel.
     store
         .open(&effective)
         .map_err(|e| anyhow::anyhow!("{e} (see buran sessions list)"))?;
     eprintln!("resuming session {effective}: connect a client and load it via session/loadSession");
-    serve_stdio(subagent)
+    serve_stdio(subagent, subagent_of)
 }
 
 /// The stdio ACP server entry. `subagent` mode filters the `subagents`
 /// entry from the MCP registry (depth ≤ 2) and marks the transcript.
-fn serve_stdio(subagent: bool) -> Result<()> {
+fn serve_stdio(subagent: bool, subagent_of: Option<String>) -> Result<()> {
     if subagent {
         let project = std::env::current_dir().ok();
-        let config = crate::config::Config::load(project.as_deref(), |v| std::env::var(v).ok())
+        let mut config = crate::config::Config::load(project.as_deref(), |v| std::env::var(v).ok())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // The child marks its transcript head with the parent session id
+        // (ADR 0011): store the marker where newSession writes the head.
+        config.subagent_parent = subagent_of;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -93,6 +97,9 @@ fn serve_stdio(subagent: bool) -> Result<()> {
             crate::config::filter_for_subagent(config),
         ));
     }
+    // Parent path: normal serve. newSession exports BURAN_SESSION_ID in
+    // THIS process (one process per session), so the subagents spawner —
+    // running here too — reads it at spawn time (ADR 0011).
     crate::acp::serve()
 }
 

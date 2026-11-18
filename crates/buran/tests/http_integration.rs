@@ -62,6 +62,7 @@ fn test_config() -> buran::config::Config {
         sessions_dir: None,
         compaction: Default::default(),
         subagents: Default::default(),
+        subagent_parent: None,
     }
 }
 

@@ -169,7 +169,20 @@ async fn run_child_turn(
 
     let outcome = tokio::time::timeout(timeout, async {
         // Spawn args resolve BEFORE the async block: no `?` inside.
-        let agent_config = AcpAgent::from_args(["serve", "--subagent"])
+        // The binary path is absolute — bare `serve` would resolve
+        // against PATH and fail.
+        let binary = std::env::current_exe()
+            .map_err(|e| format!("cannot resolve buran binary: {e}"))?;
+        let mut spawn_args = vec![
+            binary.to_string_lossy().as_ref().to_string(),
+            "serve".to_string(),
+            "--subagent".to_string(),
+        ];
+        if let Ok(parent) = std::env::var("BURAN_SESSION_ID") {
+            spawn_args.push("--subagent-of".to_string());
+            spawn_args.push(parent);
+        }
+        let agent_config = AcpAgent::from_args(spawn_args)
             .map_err(|e| e.to_string())?;
         // Text collector: chunks accumulate; the prompt response ends
         // the turn and hands the collector back its full text.
