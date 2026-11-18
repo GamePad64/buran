@@ -289,3 +289,25 @@ fn provider_context_window_parses() {
     let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
     assert_eq!(cfg.provider.as_ref().unwrap().context_window, Some(200_000));
 }
+
+#[test]
+fn mcp_servers_toml_table_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[[mcp_servers]]
+name = "fs"
+command = "/bin/true"
+args = ["a", "b"]
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert_eq!(cfg.mcp_servers.len(), 1);
+    assert_eq!(cfg.mcp_servers[0].name, "fs");
+    assert_eq!(cfg.mcp_servers[0].args, vec!["a", "b"]);
+}

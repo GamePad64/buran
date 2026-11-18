@@ -295,6 +295,10 @@ impl Config {
                         compaction_reserve = c.reserve;
                     }
                 }
+                // Project [[mcp_servers]] merge like lists do (README:
+                // "lists concatenate") — the silent drop here meant a
+                // project toml could not add an MCP server at all.
+                mcp_servers.extend(file.mcp_servers.into_iter().map(Into::into));
             }
 
             let mcp_json = project_dir.join(".mcp.json");
