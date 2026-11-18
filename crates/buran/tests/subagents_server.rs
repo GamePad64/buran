@@ -253,12 +253,23 @@ fn e2e_spawn_wait_returns_the_child_final_text_and_marks_the_transcript() {
     .unwrap();
 
     let home_path = home.path().to_path_buf();
-    // The parent-serve normally exports this at newSession time (one
-    // process per session); the test stands in for the parent.
-    // SAFETY: test process, no concurrent env readers.
-    unsafe {
-        std::env::set_var("BURAN_SESSION_ID", "parent-session-0001");
-    }
+    // A live parent session exists before the model can call spawn: its
+    // transcript is the newest uuidv7 in the store — that is the
+    // delegation flow's parent-id channel (spawn_child's comment).
+    let sessions_root = home_path.join(".local/state/buran/sessions");
+    std::fs::create_dir_all(&sessions_root).unwrap();
+    std::fs::write(
+        sessions_root.join("01940000-0000-7000-8000-000000000042.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "metadata", "model": "stub-model", "provider": "p",
+                "started_at": "2026-11-18T00:00:00Z", "ended_at": null,
+                "cwd": dir.path()
+            })
+        ),
+    )
+    .unwrap();
     let mut proc = McpProc::spawn_home(&["subagents"], &home_path, home);
     init(&mut proc);
 
@@ -295,14 +306,17 @@ fn e2e_spawn_wait_returns_the_child_final_text_and_marks_the_transcript() {
     // CHILD's own session id chain — here: the marker exists at all).
     let store_root = home_path.join(".local/state/buran/sessions");
     let entries = std::fs::read_dir(&store_root).expect("store exists");
-    let mut found = false;
+    let mut marked_with_parent = false;
     for e in entries.flatten() {
         let text = std::fs::read_to_string(e.path()).unwrap_or_default();
-        if text.contains("subagent_of") {
-            found = true;
+        if text.contains("subagent_of\":\"01940000-0000-7000-8000-000000000042") {
+            marked_with_parent = true;
         }
     }
-    assert!(found, "a child transcript carries the subagent_of marker");
+    assert!(
+        marked_with_parent,
+        "the child transcript marks subagent_of = the parent session id"
+    );
 
     drop(proc); // cleanup: kills children
 }
@@ -350,5 +364,79 @@ fn spawn_enforces_max_children() {
     assert!(
         text.contains("spawn refused") && text.contains("2"),
         "the cap names itself: {text}"
+    );
+}
+
+#[test]
+fn cap_frees_slots_when_children_finish_and_crash_reports_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/buran")).unwrap();
+    std::fs::write(
+        home.path().join(".config/buran/config.toml"),
+        "[subagents]\nenabled = true\nmax_children = 1\n\n[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"unused\"\napi_key = \"x\"\n",
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let mut proc = McpProc::spawn_home(&["subagents"], &home_path, home);
+    init(&mut proc);
+
+    // One child fills the cap of 1.
+    let resp = proc.request(
+        20,
+        "tools/call",
+        serde_json::json!({
+            "name": "spawn",
+            "arguments": {"prompt": "w", "cwd": dir.path().to_string_lossy()}
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("spawn JSON");
+    let aid = parsed["agent_id"].as_str().expect("id").to_string();
+
+    // Second spawn refused (cap 1, one live).
+    let resp = proc.request(
+        21,
+        "tools/call",
+        serde_json::json!({
+            "name": "spawn",
+            "arguments": {"prompt": "w", "cwd": dir.path().to_string_lossy()}
+        }),
+    );
+    assert!(
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("spawn refused"),
+        "cap holds while live"
+    );
+
+    // The child cannot reach an LLM → its turn FAILS (driver error), not
+    // hangs: the crash path. wait reports the failure promptly.
+    let resp = proc.request(
+        22,
+        "tools/call",
+        serde_json::json!({"name": "wait", "arguments": {"agent_id": aid, "timeout_secs": 30}}),
+    );
+    let wait_text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        wait_text.contains("failed") || wait_text.contains("error"),
+        "a dying child surfaces as an error, promptly: {wait_text}"
+    );
+
+    // THE FIX UNDER TEST: the finished child freed its slot — spawn works
+    // again (the old code bricked the server after max_children spawns).
+    let resp = proc.request(
+        23,
+        "tools/call",
+        serde_json::json!({
+            "name": "spawn",
+            "arguments": {"prompt": "w", "cwd": dir.path().to_string_lossy()}
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        !text.contains("spawn refused"),
+        "a finished child frees its slot: {text}"
     );
 }

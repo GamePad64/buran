@@ -277,25 +277,7 @@ fn build_agent(
                     Some(f) => SessionId::new(f.id().to_string()),
                     None => SessionId::new(new_session_id()),
                 };
-                // The id is needed later (BURAN_SESSION_ID for the
-                // subagents spawner), and `created_file` moves into the
-                // writer below — capture it first.
-                let transcript_id = match &created_file {
-                    Some(f) => f.id().to_string(),
-                    None => format!("degraded-{}", uuid::Uuid::now_v7()),
-                };
                 let store_file = created_file.map(|f| f.spawn_writer());
-                // One process = one session (FIXED): exporting the id
-                // process-globally is safe (nothing reads it concurrently
-                // in this design), and the subagents spawner (same
-                // process) reads it at spawn time to mark the child's
-                // transcript (ADR 0011). set_var is unsafe in edition
-                // 2024 because of multithreaded reads — this process has
-                // no other env readers at this point.
-                // SAFETY: single-sessioned process; see the comment above.
-                unsafe {
-                    std::env::set_var("BURAN_SESSION_ID", &transcript_id);
-                }
                 state_new_session
                     .sessions
                     .lock()

@@ -46,6 +46,10 @@ enum Command {
         /// by `buran subagents` alongside --subagent, not by humans.
         #[arg(long)]
         subagent_of: Option<String>,
+        /// Child provider override from `[subagents].provider` (ADR 0011):
+        /// base_url, model, api_key_env — set by `buran subagents`.
+        #[arg(long)]
+        subagent_provider: Option<String>,
     },
     /// Probe config and MCP servers, offer ACT on first run
     Doctor,
@@ -86,6 +90,7 @@ fn main() -> anyhow::Result<()> {
         listen: None,
         subagent: false,
         subagent_of: None,
+        subagent_provider: None,
     }) {
         Command::Serve {
             resume,
@@ -93,7 +98,15 @@ fn main() -> anyhow::Result<()> {
             listen,
             subagent,
             subagent_of,
-        } => buran::run::serve(resume, fork, listen, subagent, subagent_of),
+            subagent_provider,
+        } => buran::run::serve(
+            resume,
+            fork,
+            listen,
+            subagent,
+            subagent_of,
+            subagent_provider,
+        ),
         Command::Doctor => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

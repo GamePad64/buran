@@ -41,6 +41,14 @@ impl SubagentsServer {
     }
 
     fn spawn_child(&self, params: SpawnParams) -> Result<CallToolResponse, McpError> {
+        {
+            // Reap finished children: a watch whose value is already set
+            // has resolved (done or failed) — its slot is free. Finished
+            // ids stay in the map (wait on them returns the cached
+            // result) but no longer count against the cap.
+            let mut children = self.children.lock().expect("children lock");
+            children.retain(|_id, state| state.result.borrow().is_none());
+        }
         let live = self.children.lock().expect("children lock").len();
         if live >= self.config.subagents.max_children {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -52,6 +60,7 @@ impl SubagentsServer {
 
         let agent_id = uuid::Uuid::now_v7().to_string();
         let prompt = params.prompt.clone();
+        let cwd = params.cwd.clone();
         let timeout = std::time::Duration::from_secs(
             params
                 .timeout_secs
@@ -62,8 +71,33 @@ impl SubagentsServer {
         // spawns the process internally, drives the turn, and drops the
         // child on completion. No process handle in the table — the
         // driver's lifetime IS the child's lifetime.
+        //
+        // The parent id: the newest transcript in the shared store —
+        // newSession minted it right before the model could call spawn
+        // (delegation always runs inside a live session). An env channel
+        // cannot work: the subagents server starts before newSession, and
+        // env writes in a different process never reach this one. Rare
+        // race: a concurrently created session mislabels the marker —
+        // catalog cosmetics, not execution.
+        let parent_id = latest_session_id(&self.config).ok();
+        // The `[subagents].provider` override rides as a pipe triple
+        // (base_url|model|api_key_env) — the child rewrites its provider
+        // from it (ADR 0011: the cheaper child model).
+        let provider_spec = self
+            .config
+            .subagents
+            .provider
+            .as_ref()
+            .map(|p| format!("{}|{}|{}", p.base_url, p.model, p.api_key_env));
         let (result_tx, result_rx) = tokio::sync::watch::channel(None);
-        tokio::spawn(run_child_turn(prompt, timeout, result_tx));
+        tokio::spawn(run_child_turn(
+            prompt,
+            cwd,
+            parent_id,
+            provider_spec,
+            timeout,
+            result_tx,
+        ));
 
         let state = Arc::new(AgentState {
             id: agent_id.clone(),
@@ -97,12 +131,21 @@ impl SubagentsServer {
                 .timeout_secs
                 .unwrap_or(self.config.subagents.timeout_secs),
         );
-        // Block the tool call (this handler is per-request; the server's
-        // dispatch loop never parks behind it).
+        // Wait ON the current runtime via block_in_place: a plain
+        // `.await` cannot be used in this sync trait method, and the
+        // old thread+private-runtime bridge starved the driver task on
+        // single-worker runtimes (the reviewer's starvation finding).
+        // block_in_place needs a multithreaded driver — run() builds
+        // one; handlers run on it.
         let mut rx = state.result.clone();
-        let waited = tokio::runtime::Handle::try_current().is_ok();
-        let _ = waited;
-        let outcome = futures_util_lite_wait(&mut rx, timeout);
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                tokio::select! {
+                    _ = rx.changed() => rx.borrow().clone(),
+                    _ = tokio::time::sleep(timeout) => None,
+                }
+            })
+        });
         match outcome {
             Some(Ok(text)) => {
                 let payload = serde_json::json!({"status": "done", "final_text": text});
@@ -120,37 +163,19 @@ impl SubagentsServer {
     }
 }
 
-/// Synchronous-looking wait usable from a sync (non-async) trait method
-/// context: parks the current thread on a oneshot bridged from the watch.
-/// The server runs handlers on a multithreaded runtime, so blocking here
-/// parks one worker thread per wait — acceptable for v2 delegation
-/// (waits are rare relative to turns).
-fn futures_util_lite_wait(
-    rx: &mut tokio::sync::watch::Receiver<Option<Result<String, String>>>,
-    timeout: std::time::Duration,
-) -> Option<Result<String, String>> {
-    if let Some(value) = rx.borrow().clone() {
-        return Some(value);
-    }
-    let (tx, done) = std::sync::mpsc::channel();
-    let mut rx = rx.clone();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("wait runtime");
-        rt.block_on(async move {
-            tokio::select! {
-                _ = rx.changed() => {
-                    let _ = tx.send(rx.borrow().clone());
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    let _ = tx.send(None);
-                }
-            }
-        });
-    });
-    done.recv().expect("wait thread")
+/// The newest transcript id in the config's sessions root — the parent
+/// session (see spawn_child's comment for why this is the channel).
+fn latest_session_id(config: &crate::config::Config) -> anyhow::Result<String> {
+    let store = crate::store::Store::new(
+        config
+            .sessions_dir
+            .clone()
+            .unwrap_or_else(crate::store::Store::default_root),
+    );
+    store
+        .latest()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no stored sessions: the parent session has no transcript"))
 }
 
 /// The ACP driver: spawn via `AcpAgent` (the SDK owns the process and
@@ -159,6 +184,9 @@ fn futures_util_lite_wait(
 /// `spawn` returns the id immediately.
 async fn run_child_turn(
     prompt: String,
+    child_cwd: Option<String>,
+    parent_id: Option<String>,
+    provider_spec: Option<String>,
     timeout: std::time::Duration,
     result_tx: tokio::sync::watch::Sender<Option<Result<String, String>>>,
 ) {
@@ -178,16 +206,18 @@ async fn run_child_turn(
             "serve".to_string(),
             "--subagent".to_string(),
         ];
-        if let Ok(parent) = std::env::var("BURAN_SESSION_ID") {
+        if let Some(parent) = parent_id {
             spawn_args.push("--subagent-of".to_string());
             spawn_args.push(parent);
         }
-        let agent_config = AcpAgent::from_args(spawn_args)
-            .map_err(|e| e.to_string())?;
+        if let Some(provider_spec) = provider_spec {
+            spawn_args.push(format!("--subagent-provider={provider_spec}"));
+        }
+        let agent_config = AcpAgent::from_args(spawn_args).map_err(|e| e.to_string())?;
+
         // Text collector: chunks accumulate; the prompt response ends
         // the turn and hands the collector back its full text.
-        let (response_tx, response_rx) =
-            tokio::sync::oneshot::channel::<Result<String, String>>();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
         let response_tx = Arc::new(std::sync::Mutex::new(Some(response_tx)));
         let text = Arc::new(std::sync::Mutex::new(String::new()));
 
@@ -216,8 +246,15 @@ async fn run_child_turn(
                     cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
                         .await?;
+                    // The child's cwd IS the spawn parameter: newSession
+                    // records it in the transcript head (and Config::load
+                    // reads the project config from it).
+                    let cwd = child_cwd
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     let SessionSetup { mut session, .. } = cx
-                        .build_session(std::env::current_dir().unwrap_or_default())
+                        .build_session(cwd)
                         .block_task()
                         .start_session()
                         .await?;

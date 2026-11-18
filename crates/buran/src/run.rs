@@ -16,6 +16,7 @@ pub fn serve(
     listen: Option<std::net::SocketAddr>,
     subagent: bool,
     subagent_of: Option<String>,
+    subagent_provider: Option<String>,
 ) -> Result<()> {
     if listen.is_some() && (resume.is_some() || fork.is_some()) {
         anyhow::bail!(
@@ -70,19 +71,23 @@ pub fn serve(
             target
         }
     } else {
-        return serve_stdio(subagent, subagent_of);
+        return serve_stdio(subagent, subagent_of, subagent_provider);
     };
     // Fail fast on an unknown id, before stdout becomes the ACP channel.
     store
         .open(&effective)
         .map_err(|e| anyhow::anyhow!("{e} (see buran sessions list)"))?;
     eprintln!("resuming session {effective}: connect a client and load it via session/loadSession");
-    serve_stdio(subagent, subagent_of)
+    serve_stdio(subagent, subagent_of, subagent_provider)
 }
 
 /// The stdio ACP server entry. `subagent` mode filters the `subagents`
 /// entry from the MCP registry (depth ≤ 2) and marks the transcript.
-fn serve_stdio(subagent: bool, subagent_of: Option<String>) -> Result<()> {
+fn serve_stdio(
+    subagent: bool,
+    subagent_of: Option<String>,
+    subagent_provider: Option<String>,
+) -> Result<()> {
     if subagent {
         let project = std::env::current_dir().ok();
         let mut config = crate::config::Config::load(project.as_deref(), |v| std::env::var(v).ok())
@@ -90,6 +95,17 @@ fn serve_stdio(subagent: bool, subagent_of: Option<String>) -> Result<()> {
         // The child marks its transcript head with the parent session id
         // (ADR 0011): store the marker where newSession writes the head.
         config.subagent_parent = subagent_of;
+        // `[subagents].provider` override: pipe-separated triple from the
+        // spawner — the child's LLM is the configured cheaper model, not
+        // the parent's.
+        if let Some(spec) = subagent_provider
+            && let [base_url, model, api_key_env] = spec.splitn(3, '|').collect::<Vec<_>>()[..]
+            && let Some(p) = config.provider.as_mut()
+        {
+            p.base_url = base_url.to_string();
+            p.model = model.to_string();
+            p.api_key = crate::config::ApiKey::FromEnv(api_key_env.to_string());
+        }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
