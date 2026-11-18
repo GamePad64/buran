@@ -80,6 +80,10 @@ struct ServerState {
     /// `context_window` from the provider config; `None` = the 128k hard
     /// default, materialized here so the check is one comparison.
     provider_window: Option<usize>,
+    /// `[compaction.summarizer]` when configured: summaries call THIS
+    /// provider (the Aider use case — a cheaper model), not the session
+    /// one. `None` = session provider everywhere.
+    summarizer_provider: Option<ProviderConfig>,
 }
 
 /// Builds the buran ACP agent from the real filesystem config and an
@@ -152,10 +156,22 @@ pub async fn agent_builder_with_config(
         .as_ref()
         .and_then(|p| p.context_window)
         .or(Some(128_000));
+    let summarizer_provider = config
+        .compaction
+        .summarizer
+        .as_ref()
+        .map(|s| ProviderConfig {
+            name: "compaction-summarizer".into(),
+            base_url: s.base_url.clone(),
+            model: s.model.clone(),
+            api_key: crate::config::ApiKey::FromEnv(s.api_key_env.clone()),
+            context_window: None,
+        });
     let state = Arc::new(ServerState {
         compaction_auto: config.compaction.auto,
         compaction_reserve: config.compaction.reserve,
         provider_window,
+        summarizer_provider,
         config,
         store,
         mcp: Arc::new(mcp),
@@ -593,9 +609,8 @@ async fn run_compact_command(
     conn: &ConnectionTo<AcpClient>,
     instructions: &str,
 ) -> Result<StopReason, PromptError> {
-    let llm =
-        (state.llm_factory)(provider).map_err(|e| PromptError::Rejected(anyhow::anyhow!("{e}")))?;
-    let summarizer = crate::compact::summarizer::BuiltinSummarizer::new(llm);
+    let summarizer = summarizer_for(state, provider)
+        .map_err(|e| PromptError::Rejected(anyhow::anyhow!("{e}")))?;
 
     // Take the session out for the duration; cut_span reads history only.
     let (mut session, writer) = {
@@ -818,6 +833,18 @@ async fn run_prompt_turn(
     result.map_err(PromptError::MidTurn).map(|(stop, _)| stop)
 }
 
+/// The summarizer client: `[compaction.summarizer]`'s provider when
+/// configured, the session provider otherwise. Both compaction paths
+/// (manual and auto) go through here so the two never diverge.
+fn summarizer_for(
+    state: &ServerState,
+    provider: &ProviderConfig,
+) -> Result<crate::compact::summarizer::BuiltinSummarizer, LlmError> {
+    let target = state.summarizer_provider.as_ref().unwrap_or(provider);
+    let llm = (state.llm_factory)(target)?;
+    Ok(crate::compact::summarizer::BuiltinSummarizer::new(llm))
+}
+
 /// One silent compaction pass for the auto path: take the session out,
 /// cut keeping HALF the current window (auto keeps more than manual —
 /// the goal is fitting the budget, not shrinking hard), summarize,
@@ -828,8 +855,7 @@ async fn run_auto_compact(
     session_id: &SessionId,
     _conn: &ConnectionTo<AcpClient>,
 ) -> anyhow::Result<usize> {
-    let llm = (state.llm_factory)(provider)?;
-    let summarizer = crate::compact::summarizer::BuiltinSummarizer::new(llm);
+    let summarizer = summarizer_for(state, provider)?;
     let (mut session, writer) = {
         let mut sessions = state.sessions.lock().expect("sessions lock");
         let handle = sessions

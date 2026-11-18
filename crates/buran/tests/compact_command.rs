@@ -363,3 +363,88 @@ async fn auto_compact_fires_after_a_turn_crossing_the_threshold() {
         "the compacted span (user half) left the window"
     );
 }
+
+/// `[compaction.summarizer]` (ADR 0006, the Aider use case): the
+/// summary call goes to the CONFIGURED ALTERNATE provider, the turn to
+/// the session provider. The test factory distinguishes by base_url.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_summarizer_section_routes_summary_to_the_alternate_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = MockTransport::new();
+    // All rounds land in ONE mock; assertions are per-request URI.
+    let turn1 = format!("data: {}\n\n{}", text_chunk("answer one"), stop_and_done());
+    let summary = format!(
+        "data: {}\n\n{}",
+        text_chunk("CHEAP SUMMARY"),
+        stop_and_done()
+    );
+    m.push_response_frames(sse(vec![Box::leak(turn1.into_boxed_str())]));
+    m.push_response_frames(sse(vec![Box::leak(summary.into_boxed_str())]));
+    let m2 = m.clone();
+
+    let mut config = test_config(Some(dir.path().to_path_buf()));
+    config.compaction.summarizer = Some(buran::config::SummarizerProvider {
+        base_url: "http://cheap.test/v1".into(),
+        model: "cheap-model".into(),
+        api_key_env: "CHEAP_KEY".into(),
+    });
+
+    let agent =
+        buran::acp::agent_builder_with_config(config, move |p: &buran::config::ProviderConfig| {
+            // The factory honors the provider it is handed: the session
+            // provider and the summarizer provider produce clients with
+            // DIFFERENT base URLs — that distinction is the test's subject.
+            Ok(LlmClient::with_transport(
+                p.clone(),
+                Http::builder(m2.clone()).build().unwrap(),
+            ))
+        })
+        .await
+        .expect("agent builder");
+
+    let client = Client.v1().connect_with(agent, async |cx| {
+        initialize(&cx).await?;
+        let SessionSetup { mut session, .. } = cx
+            .build_session(std::env::current_dir().unwrap())
+            .block_task()
+            .start_session()
+            .await?;
+        session.send_prompt("first")?;
+        let _ = drain_to_response(&mut session).await?;
+        session.send_prompt("/compact")?;
+        let note = drain_to_response(&mut session).await?;
+        assert!(
+            note.contains("CHEAP SUMMARY"),
+            "the summary came back: {note}"
+        );
+        Ok(())
+    });
+    tokio::time::timeout(TIMEOUT, client)
+        .await
+        .expect("timed out")
+        .expect("connection failed");
+
+    let requests = m.requests();
+    assert!(requests.len() >= 2, "turn + summary");
+    // Session-provider URI vs the cheap one.
+    let session_uri = requests[0].uri.to_string();
+    let summary_uri = requests[1].uri.to_string();
+    assert!(
+        !summary_uri.contains("mock.test"),
+        "summary must NOT hit the session provider: {summary_uri}"
+    );
+    assert!(
+        summary_uri.contains("cheap.test"),
+        "summary must hit the configured alternate: {summary_uri}"
+    );
+    assert!(
+        session_uri.contains("mock.test"),
+        "the turn stays on the session provider: {session_uri}"
+    );
+    // And the cheap model's name is on the wire.
+    assert!(
+        body_contains(&requests[1], "cheap-model"),
+        "the summarizer model from the section: {}",
+        summary_uri
+    );
+}

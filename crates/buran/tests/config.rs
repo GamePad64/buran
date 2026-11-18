@@ -311,3 +311,40 @@ args = ["a", "b"]
     assert_eq!(cfg.mcp_servers[0].name, "fs");
     assert_eq!(cfg.mcp_servers[0].args, vec!["a", "b"]);
 }
+
+#[test]
+fn compaction_summarizer_section_parses_and_defaults_absent() {
+    // Absent: summarizer = None → summaries use the session provider.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://x/v1\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert!(
+        cfg.compaction.summarizer.is_none(),
+        "no section, no override"
+    );
+
+    // Present: the full inline provider shape.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[compaction.summarizer]
+base_url = "http://cheap.local/v1"
+model = "cheap-model"
+api_key_env = "CHEAP_KEY"
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    let s = cfg.compaction.summarizer.expect("section parsed");
+    assert_eq!(s.base_url, "http://cheap.local/v1");
+    assert_eq!(s.model, "cheap-model");
+    assert_eq!(s.api_key_env, "CHEAP_KEY");
+}

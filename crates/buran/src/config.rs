@@ -107,6 +107,20 @@ pub struct CompactionConfig {
     /// and tool traffic; auto-compact triggers above
     /// `context_window − reserve`.
     pub reserve: usize,
+    /// Inline provider for summaries (ADR 0006, the Aider use case:
+    /// summarize with a cheaper model). `None` = summaries use the
+    /// session provider. Inline, not a provider registry — one use case
+    /// does not justify a subsystem.
+    pub summarizer: Option<SummarizerProvider>,
+}
+
+/// `[compaction.summarizer]`: the minimal OpenAI-compatible provider
+/// shape a summary call needs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SummarizerProvider {
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
 }
 
 impl Default for CompactionConfig {
@@ -114,6 +128,7 @@ impl Default for CompactionConfig {
         Self {
             auto: true,
             reserve: 8192,
+            summarizer: None,
         }
     }
 }
@@ -217,6 +232,7 @@ struct ConfigFile {
 struct CompactionToml {
     auto: Option<bool>,
     reserve: Option<usize>,
+    summarizer: Option<SummarizerProvider>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -251,6 +267,7 @@ impl Config {
         let mut compaction = CompactionConfig::default();
         let mut compaction_auto: Option<bool> = None;
         let mut compaction_reserve: Option<usize> = None;
+        let mut compaction_summarizer: Option<SummarizerProvider> = None;
         let mut seen_provider = false;
 
         if let Some(home) = home.as_deref() {
@@ -269,6 +286,7 @@ impl Config {
                 if let Some(c) = &file.compaction {
                     compaction_auto = c.auto;
                     compaction_reserve = c.reserve;
+                    compaction_summarizer = c.summarizer.clone();
                 }
             }
         }
@@ -293,6 +311,9 @@ impl Config {
                     }
                     if c.reserve.is_some() {
                         compaction_reserve = c.reserve;
+                    }
+                    if c.summarizer.is_some() {
+                        compaction_summarizer = c.summarizer.clone();
                     }
                 }
                 // Project [[mcp_servers]] merge like lists do (README:
@@ -347,6 +368,7 @@ impl Config {
         if let Some(reserve) = compaction_reserve {
             compaction.reserve = reserve;
         }
+        compaction.summarizer = compaction_summarizer;
 
         Ok(Self {
             provider,
