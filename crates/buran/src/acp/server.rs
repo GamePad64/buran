@@ -1015,7 +1015,10 @@ async fn run_prompt_turn_inner(
         // Spec (hardening v1.5.1, Section 2): the streak threshold
         // *defaults* to 4 — production turns always carry the guard;
         // tests opt into other thresholds explicitly via the builder.
-        .with_same_tool_streak_guard(4);
+        .with_same_tool_streak_guard(4)
+        // User event hooks (ADR 0012) from `[hooks]` in the config.
+        .with_post_tool_use(state.config.hooks.post_tool_use.clone())
+        .with_on_turn_end(state.config.hooks.on_turn_end.clone());
 
     let (events_tx, mut events_rx) = mpsc::channel::<TurnEvent>(64);
     let (perm_tx, perm_rx) = mpsc::channel::<PermissionDecision>(8);
