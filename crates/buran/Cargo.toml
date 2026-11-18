@@ -20,7 +20,7 @@ hclient = { version = "0.1.0-alpha.20", features = ["default-transport", "json"]
 agent-client-protocol = { version = "5", features = ["stdio"] }
 agent-client-protocol-http = { workspace = true }
 axum = { workspace = true }
-rmcp = { version = "3.9.0", default-features = false, features = ["client", "macros", "transport-child-process"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-async-rw", "transport-io"] }
 uuid.workspace = true
 
 [dev-dependencies]

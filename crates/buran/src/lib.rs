@@ -9,3 +9,4 @@ pub mod run;
 pub mod session;
 pub mod skills;
 pub mod store;
+pub mod subagents;

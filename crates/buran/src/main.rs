@@ -45,6 +45,9 @@ enum Command {
     },
     /// Probe config and MCP servers, offer ACT on first run
     Doctor,
+    /// Run the delegation MCP server (ADR 0011): spawn/wait for child
+    /// buran agents. Registered as an MCP server in .mcp.json.
+    Subagents,
     /// Introspect configured MCP servers
     Mcp {
         #[command(subcommand)]
@@ -90,6 +93,12 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             rt.block_on(buran::run::doctor())
+        }
+        Command::Subagents => {
+            let project = std::env::current_dir().ok();
+            let config = buran::config::Config::load(project.as_deref(), |v| std::env::var(v).ok())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            buran::subagents::run(config)
         }
         Command::Mcp { cmd } => match cmd {
             McpCommand::List => buran::run::mcp_list(),
