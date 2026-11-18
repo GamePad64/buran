@@ -130,3 +130,66 @@ fn spawn_returns_an_agent_id_for_a_lifecycle_child() {
         "spawn answers with an agent id: {text}"
     );
 }
+
+#[test]
+fn wait_unknown_id_errors_and_wait_timeout_reports_status() {
+    let mut proc = McpProc::spawn(&["subagents"]);
+    init(&mut proc);
+
+    // Unknown id: a tool ERROR text (isError content), not a crash.
+    let resp = proc.request(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "wait",
+            "arguments": {"agent_id": "no-such-id", "timeout_secs": 1}
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("unknown agent_id"),
+        "unknown id surfaces as an error text: {text}"
+    );
+
+    // A real child with an unreachable provider: wait hits the timeout
+    // and reports status=timeout honestly (never hangs the tool past
+    // its own cap).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"unused\"\napi_key = \"x\"\n",
+    )
+    .unwrap();
+    let resp = proc.request(
+        3,
+        "tools/call",
+        serde_json::json!({
+            "name": "spawn",
+            "arguments": {"prompt": "do a thing", "cwd": dir.path().to_string_lossy()}
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("spawn text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("spawn JSON");
+    let agent_id: String = parsed["agent_id"]
+        .as_str()
+        .expect("agent_id field")
+        .to_string();
+
+    let resp = proc.request(
+        4,
+        "tools/call",
+        serde_json::json!({
+            "name": "wait",
+            "arguments": {"agent_id": agent_id, "timeout_secs": 3}
+        }),
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("wait text");
+    assert!(
+        text.contains("timeout") || text.contains("failed"),
+        "an unreachable-provider child ends in timeout or failure, honestly: {text}"
+    );
+}
