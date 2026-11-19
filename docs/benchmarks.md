@@ -49,6 +49,7 @@ agent-side only.
 | Cold start (spawn → accepts first RPC) | **p50 4 ms** (10 runs, min 2, max 7) | ~0.4 s to config-loaded failure; ~1 s+ warm one-shot end-to-end | seconds (node + 350 MB tree) | not measured |
 | One-shot prompt roundtrip (same gateway) | **18–25 ms** agent-side overhead (wall 0.4–1.7 s incl. LLM — gateway varies) | 0.5–3.4 s wall (LiteLLM discovery on cold runs; warm ~0.5–1.4 s) | not comparable headless (bg-spare fleet is the resident cost) | not measured |
 | Runtime dependencies | **none** (statically linked musl/gnu targets; node not needed) | node 26 (bundled via pi-node), npm tree | node (bundled), npm tree | node/bun |
+| Outbound connections by design | **1 — the LLM provider you configured** (nothing else; logs stay local) | none beyond the provider | **4 telemetry channels on by default**: Anthropic events, OpenTelemetry, two Datadog endpoints; each event carries email, device ID, hashed git remote, HEAD SHA; persistent offline queue; background agents (`autoDream` grep past transcripts daily, `awaySummary` while unfocused) — see [habr teardown of v2.1.294](https://habr.com/ru/articles/1109634/); all of it is disable-able via env vars, off-by-default is not the default | provider |
 | Uninstall = | `rm` two files | `rm -rf ~/.pi` (314 MB) | `rm -rf` 350 MB + plugin cache | — |
 
 ## Honest caveats
@@ -60,7 +61,11 @@ agent-side only.
 - Claude Code's `bg-spare` fleet (11 processes, 1.75 GB) is this machine's
   specific state (background jobs enabled), not a universal constant; a
   bare interactive Claude Code is nearer 100–200 MB. The install footprint
-  (350 MB on disk) is the stable number.
+  (350 MB on disk) is the stable number. The 2026-11-19
+  [teardown of v2.1.294](https://habr.com/ru/articles/1109634/) explains
+  where the fleet comes from: hidden background agents (`autoDream`
+  memory consolidation over past transcripts, `awaySummary` for unfocused
+  windows) — a design choice, not machine noise.
 - buran's "one process per session" is by design (AGENTS.md FIXED): the
   fleet row compares *equivalent work*, not a bug.
 - buran one-shot agent-side overhead (16–34 ms) excludes the LLM; wall
