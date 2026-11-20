@@ -1,46 +1,93 @@
 //! AGENTS.md loader for system instructions.
 //!
-//! Gateway-style layering (ADR 0003): every ancestor directory from the repo
-//! root down to the project directory may carry an `AGENTS.md`; all found
-//! layers are concatenated root-first so the nearest (most specific) file
-//! speaks last. A `CLAUDE.md` file is never read — only an actual
-//! `AGENTS.md` filename counts (Claude Code's symlink to it resolves through
-//! the filesystem, so the real file is what we see).
+//! Gateway-style layering (ADR 0003 + configurable names): the searched
+//! FILE NAMES come from config (default `["AGENTS.md"]`; adding
+//! `CLAUDE.md` lets buran absorb Claude Code projects). Three phases,
+//! order preserved end-to-end:
+//!
+//! 1. **Collect** — walk ancestors leaf → root; per directory, the
+//!    configured names in config order.
+//! 2. **Canonicalize** — resolve symlinks; broken links drop out
+//!    (fail-open, like unreadable layers).
+//! 3. **Dedup, first occurrence wins** — a `CLAUDE.md -> AGENTS.md`
+//!    symlink twin loads once, at the SYMLINK's position (the nearest
+//!    layer speaks for its directory).
+//!
+//! Unreadable layers are skipped with a debug log — a broken instruction
+//! file must never crash the server.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-/// Collects AGENTS.md instructions from `project_dir` and its ancestors.
-/// Empty string when nothing is found. Unreadable layers are skipped with a
-/// debug log — a broken instruction file must never crash the server.
-pub fn load_system_instructions(project_dir: Option<&Path>) -> String {
+/// Default searched names (ADR 0003).
+pub const DEFAULT_FILES: &[&str] = &["AGENTS.md"];
+
+/// Collects instruction-file instructions from `project_dir` and its
+/// ancestors, searching `names` (in config order). Empty string when
+/// nothing is found.
+pub fn load_system_instructions_with(project_dir: Option<&Path>, names: &[String]) -> String {
     let Some(project_dir) = project_dir else {
         return String::new();
     };
+    if names.is_empty() {
+        return String::new();
+    }
 
-    // Ancestors run leaf → root; reverse so root speaks first.
-    let mut layers: Vec<(std::path::PathBuf, String)> = project_dir
-        .ancestors()
-        .map(|dir| dir.join("AGENTS.md"))
-        .filter(|path| path.is_file())
-        .filter_map(|path| {
-            std::fs::read_to_string(&path)
+    // Phase 1: collect candidate paths — ROOT → leaf (general rules speak
+    // before specific ones, ADR 0003); within a directory, config order.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = project_dir.ancestors().map(Path::to_path_buf).collect();
+    dirs.reverse(); // ancestors() is leaf → root; root must speak first
+    for dir in dirs {
+        for name in names {
+            let path = dir.join(name);
+            if path.is_file() {
+                candidates.push(path);
+            }
+        }
+    }
+
+    // Phase 2: canonicalize (resolves symlinks + normalizes). Broken
+    // links fail-open: dropped here, logged.
+    let mut canonical: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        match path.canonicalize() {
+            Ok(real) => canonical.push(real),
+            Err(source) => {
+                tracing::debug!(?path, %source, "skipping broken instruction-file link");
+            }
+        }
+    }
+
+    // Phase 3: dedup keeping FIRST occurrence — a symlink twin loads once,
+    // at the symlink's position.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let texts: Vec<String> = canonical
+        .into_iter()
+        .filter(|real| seen.insert(real.clone()))
+        .filter_map(|real| {
+            std::fs::read_to_string(&real)
                 .map_err(|source| {
-                    tracing::debug!(?path, %source, "skipping unreadable AGENTS.md");
+                    tracing::debug!(?real, %source, "skipping unreadable instruction file");
                     source
                 })
                 .ok()
-                .map(|text| (path, text))
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
         })
         .collect();
-    layers.reverse();
 
-    let joined = layers
-        .into_iter()
-        .map(|(_, text)| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    tracing::debug!(bytes = joined.len(), "loaded AGENTS.md instructions");
+    let joined = texts.join("\n\n");
+    tracing::debug!(
+        files = seen.len(),
+        bytes = joined.len(),
+        "loaded instruction files"
+    );
     joined
+}
+
+/// Backward-compatible entry: the default names only.
+pub fn load_system_instructions(project_dir: Option<&Path>) -> String {
+    let names: Vec<String> = DEFAULT_FILES.iter().map(|s| s.to_string()).collect();
+    load_system_instructions_with(project_dir, &names)
 }

@@ -106,6 +106,7 @@ fn test_config(skills_dirs: Vec<std::path::PathBuf>) -> buran::config::Config {
         compaction: Default::default(),
         subagents: Default::default(),
         subagent_parent: None,
+        agentsmd: Default::default(),
         hooks: Default::default(),
     }
 }

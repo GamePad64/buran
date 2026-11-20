@@ -39,6 +39,7 @@ fn test_config(sessions_dir: Option<std::path::PathBuf>) -> Config {
         compaction: Default::default(),
         subagents: Default::default(),
         subagent_parent: None,
+        agentsmd: Default::default(),
         hooks: Default::default(),
     }
 }

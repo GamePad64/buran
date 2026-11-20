@@ -231,8 +231,11 @@ fn build_agent(
                     // (honest rejection, recorded in ADR 0003).
                     tracing::warn!("client-supplied MCP servers not supported yet");
                 }
-                let system_prompt =
-                    build_system_prompt(&req.cwd, &state_new_session.config.skills_dirs);
+                let system_prompt = build_system_prompt(
+                    &req.cwd,
+                    &state_new_session.config.skills_dirs,
+                    &state_new_session.config.agentsmd.files,
+                );
                 let skills = crate::skills::scan(&state_new_session.config.skills_dirs);
                 let (cancel_tx, _) = watch::channel(false);
                 // Transcript head: model/provider/cwd pin the session's
@@ -361,6 +364,7 @@ fn build_agent(
                         system_prompt: build_system_prompt(
                             &req.cwd,
                             &state_load.config.skills_dirs,
+                            &state_load.config.agentsmd.files,
                         ),
                         skills: crate::skills::scan(&state_load.config.skills_dirs),
                         session: SessionState {
@@ -1187,8 +1191,10 @@ fn turn_counter() -> u64 {
 fn build_system_prompt(
     project_dir: &std::path::Path,
     skills_dirs: &[std::path::PathBuf],
+    instruction_files: &[String],
 ) -> String {
-    let agentsmd = crate::agentsmd::load_system_instructions(Some(project_dir));
+    let agentsmd =
+        crate::agentsmd::load_system_instructions_with(Some(project_dir), instruction_files);
     let skills = crate::skills::scan(skills_dirs);
     let mut prompt = agentsmd;
     if !skills.is_empty() {

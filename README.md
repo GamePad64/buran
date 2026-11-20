@@ -76,7 +76,14 @@ Global MCP servers go under `[[mcp_servers]]` in `config.toml` with the same `na
 
 ### AGENTS.md
 
-Project instructions, read automatically (the way Claude Code reads CLAUDE.md). Every ancestor directory from the repo root down to the project may carry an `AGENTS.md`; layers concatenate root-first, nearest file last.
+Project instructions, read automatically (the way Claude Code reads CLAUDE.md). Every ancestor directory from the repo root down to the project may carry an `AGENTS.md`; layers concatenate root-first, nearest file last. The searched file names are configurable — to absorb Claude Code projects, add `CLAUDE.md`:
+
+```toml
+[agentsmd]
+files = ["AGENTS.md", "CLAUDE.md"]
+```
+
+Symlinks resolve (a `CLAUDE.md -> AGENTS.md` twin loads once, at the nearest position); broken links are skipped; duplicate content is deduplicated, first occurrence wins.
 
 ### Skills
 

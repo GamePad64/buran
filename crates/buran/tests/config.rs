@@ -464,3 +464,32 @@ timeout_secs = 3
     assert_eq!(cfg.hooks.on_turn_end.as_deref(), Some("my-bell"));
     assert_eq!(cfg.hooks.timeout_secs, 3);
 }
+
+#[test]
+fn agentsmd_files_parse_and_default() {
+    // Default: AGENTS.md only.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        "[provider]\nbase_url = \"http://x/v1\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert_eq!(cfg.agentsmd.files, vec!["AGENTS.md"]);
+
+    // Configured: CLAUDE.md added.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("buran.config.toml"),
+        r#"
+[provider]
+base_url = "http://x/v1"
+model = "m"
+[agentsmd]
+files = ["AGENTS.md", "CLAUDE.md"]
+"#,
+    )
+    .unwrap();
+    let cfg = Config::load(Some(dir.path()), |_| None).unwrap();
+    assert_eq!(cfg.agentsmd.files, vec!["AGENTS.md", "CLAUDE.md"]);
+}

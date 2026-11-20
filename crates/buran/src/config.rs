@@ -219,10 +219,36 @@ pub struct Config {
     /// `[hooks]` user event hooks (ADR 0012): commands run at harness
     /// events; fail-open.
     pub hooks: HooksConfig,
+    /// `[agentsmd]` searched instruction-file names (default
+    /// `["AGENTS.md"]`; adding "CLAUDE.md" absorbs Claude Code projects).
+    pub agentsmd: AgentsMdConfig,
     /// Parent session id when this server runs AS a subagent
     /// (`--subagent-of`); newSession writes it into the transcript head.
     /// Not a config-file key — a CLI-injected runtime field.
     pub subagent_parent: Option<String>,
+}
+
+/// `[agentsmd]`: which instruction-file names the loader searches
+/// (default: AGENTS.md only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentsMdConfig {
+    pub files: Vec<String>,
+}
+
+impl Default for AgentsMdConfig {
+    fn default() -> Self {
+        Self {
+            files: buran_default_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
+/// The default searched names, shared with the loader.
+pub fn buran_default_names() -> &'static [&'static str] {
+    &["AGENTS.md"]
 }
 
 /// `[hooks]`: user event-hook commands (ADR 0012). One command per
@@ -293,6 +319,13 @@ struct ConfigFile {
     compaction: Option<CompactionToml>,
     subagents: Option<SubagentsToml>,
     hooks: Option<HooksToml>,
+    agentsmd: Option<AgentsMdToml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct AgentsMdToml {
+    files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -355,6 +388,7 @@ impl Config {
         let mut compaction_summarizer: Option<SummarizerProvider> = None;
         let mut subagents = SubagentsConfig::default();
         let mut hooks = HooksConfig::default();
+        let mut agentsmd_files: Option<Vec<String>> = None;
         let mut seen_provider = false;
 
         if let Some(home) = home.as_deref() {
@@ -375,6 +409,11 @@ impl Config {
                     compaction_reserve = c.reserve;
                     compaction_summarizer = c.summarizer.clone();
                 }
+                if let Some(a) = &file.agentsmd
+                    && a.files.is_some()
+                {
+                    agentsmd_files = a.files.clone();
+                }
                 if let Some(h) = &file.hooks {
                     if h.post_tool_use.is_some() {
                         hooks.post_tool_use = h.post_tool_use.clone();
@@ -385,6 +424,11 @@ impl Config {
                     if let Some(secs) = h.timeout_secs {
                         hooks.timeout_secs = secs;
                     }
+                }
+                if let Some(a) = &file.agentsmd
+                    && a.files.is_some()
+                {
+                    agentsmd_files = a.files.clone();
                 }
                 if let Some(s) = &file.subagents {
                     if let Some(enabled) = s.enabled {
@@ -428,6 +472,11 @@ impl Config {
                         compaction_summarizer = c.summarizer.clone();
                     }
                 }
+                if let Some(a) = &file.agentsmd
+                    && a.files.is_some()
+                {
+                    agentsmd_files = a.files.clone();
+                }
                 if let Some(h) = &file.hooks {
                     if h.post_tool_use.is_some() {
                         hooks.post_tool_use = h.post_tool_use.clone();
@@ -438,6 +487,11 @@ impl Config {
                     if let Some(secs) = h.timeout_secs {
                         hooks.timeout_secs = secs;
                     }
+                }
+                if let Some(a) = &file.agentsmd
+                    && a.files.is_some()
+                {
+                    agentsmd_files = a.files.clone();
                 }
                 if let Some(s) = &file.subagents {
                     if let Some(enabled) = s.enabled {
@@ -518,6 +572,14 @@ impl Config {
             subagents,
             subagent_parent: None,
             hooks,
+            agentsmd: AgentsMdConfig {
+                files: agentsmd_files.unwrap_or_else(|| {
+                    buran_default_names()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                }),
+            },
         })
     }
 }
