@@ -338,10 +338,23 @@ impl McpManager {
 /// gone rather than the tool merely returning an MCP-level error: only
 /// these are worth a lazy restart.
 fn is_restartable(error: &rmcp::ServiceError) -> bool {
-    matches!(
-        error,
-        rmcp::ServiceError::TransportClosed | rmcp::ServiceError::TransportSend(_)
-    )
+    match error {
+        rmcp::ServiceError::TransportClosed | rmcp::ServiceError::TransportSend(_) => true,
+        // A poisoned WASM store (act runtime): after one wasm trap the
+        // wasmtime Store is marked trapped FOREVER (`may_enter = !trapped`),
+        // so every later call fails with `cannot enter component instance`
+        // wrapped by the actor as `run_concurrent failed: ...`. The poison
+        // lives in the PROCESS — a fresh `act run` has a fresh Store, so a
+        // respawn clears it. Matched by message because it arrives as a
+        // protocol-level MCP error, not a transport failure.
+        rmcp::ServiceError::McpError(data)
+            if data.message.contains("cannot enter component instance")
+                || data.message.contains("run_concurrent failed") =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Splits `"server/tool"` into `("server", "tool")`. Tool names may contain

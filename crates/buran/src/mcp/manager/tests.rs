@@ -52,3 +52,28 @@ fn transport_errors_are_restartable_and_mcp_errors_are_not() {
         reason: None
     }));
 }
+
+/// A poisoned WASM store (act's `cannot enter component instance`) comes
+/// through as a protocol-level error carrying the trap text — and it IS
+/// restartable: a fresh `act run` process has a fresh Store, so the poison
+/// clears with a respawn. Without this, one trap bricks the server until
+/// the buran process dies (the 2026-11-23 dogfood finding).
+#[test]
+fn poisoned_wasm_store_errors_are_restartable() {
+    use rmcp::model::ErrorData;
+    // The exact shape from the dogfood session: Mcp protocol error, message
+    // carrying the trap + the actor's wrapper.
+    let mcp = ErrorData::internal_error(
+        "call-tool failed: Mcp error: -32603: run_concurrent failed: cannot enter component instance",
+        None,
+    );
+    let err = rmcp::ServiceError::McpError(mcp);
+    assert!(
+        is_restartable(&err),
+        "poisoned-store trap text must trigger a respawn"
+    );
+
+    // Sanity: an unrelated MCP protocol error is still NOT restartable.
+    let unrelated = rmcp::ServiceError::McpError(ErrorData::invalid_params("nope", None));
+    assert!(!is_restartable(&unrelated));
+}
