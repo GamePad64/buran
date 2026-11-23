@@ -379,7 +379,6 @@ mod tool_call_visibility {
     //! shows what the agent did.
 
     use super::*;
-    use agent_client_protocol::v1::schema::SessionUpdate;
 
     fn fake_agent_with_tool_call() -> String {
         r#"

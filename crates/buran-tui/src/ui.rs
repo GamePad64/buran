@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::acp_client::{Answer, PermissionQuestion};
 
@@ -72,13 +72,17 @@ pub struct CommandRow {
     pub description: String,
 }
 
-/// Whole UI state: transcript, input buffer, pending permission question,
-/// scroll offset (`None` = stick to bottom), turn status, the picker
-/// overlay when open, and the command registry + menu state.
+/// Whole UI state: transcript, input buffer + cursor, pending permission
+/// question, scroll offset (`None` = stick to bottom), turn status, the
+/// picker overlay when open, and the command registry + menu state.
 #[derive(Default)]
 pub struct App {
     pub entries: Vec<Entry>,
     pub input: String,
+    /// Cursor position within `input` as a byte offset. Invariant: always
+    /// on a char boundary — every mutation moves it by whole chars, so
+    /// slicing `input[..cursor]` is safe.
+    pub cursor: usize,
     /// `Some` while the agent awaits a permission answer.
     pub question: Option<PermissionQuestion>,
     /// Manual scroll offset from the bottom; `None` follows the tail.
@@ -171,6 +175,49 @@ impl App {
         self.scroll = None;
     }
 
+    /// Inserts a char at the cursor and moves the cursor after it.
+    fn insert_char(&mut self, ch: char) {
+        let at = self.cursor.min(self.input.len());
+        self.input.insert(at, ch);
+        self.cursor = at + ch.len_utf8();
+    }
+
+    /// Deletes the char before the cursor (Backspace semantics); no-op at
+    /// the start of the line.
+    fn delete_before_cursor(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.input[..self.cursor]
+            .chars()
+            .next_back()
+            .expect("cursor > 0 means a char exists before it");
+        let start = self.cursor - prev.len_utf8();
+        self.input.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Moves the cursor one char left; no-op at the line start.
+    fn cursor_left(&mut self) {
+        if let Some(prev) = self.input[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    /// Moves the cursor one char right; no-op at the line end.
+    fn cursor_right(&mut self) {
+        if let Some(next) = self.input[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    /// Clears the input after submit: buffer and cursor reset together —
+    /// a stale cursor past an empty buffer would break the invariant.
+    fn take_input(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.input)
+    }
+
     /// Maps a key press to an action. While the permission modal is up it
     /// captures y/n/Esc; otherwise input keys edit the buffer.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -246,12 +293,12 @@ impl App {
                     && self.input.is_empty()
                     && !self.commands.is_empty() =>
             {
-                self.input.push('/');
+                self.insert_char('/');
                 self.menu_selected = Some(0);
                 Action::None
             }
             (_, KeyCode::Char(ch)) if self.menu_selected.is_some() => {
-                self.input.push(ch);
+                self.insert_char(ch);
                 // Typing narrows the rows; keep the selection in range.
                 let rows = self.menu_rows_filtered().len();
                 if let Some(selected) = self.menu_selected.as_mut() {
@@ -269,6 +316,7 @@ impl App {
                     && let Some(row) = rows.get(selected)
                 {
                     self.input = format!("/{}", row.name);
+                    self.cursor = self.input.len();
                 }
                 self.menu_selected = None;
                 Action::None
@@ -291,14 +339,14 @@ impl App {
                 Action::None
             }
             (_, KeyCode::Backspace) if self.menu_selected.is_some() => {
-                self.input.pop();
+                self.delete_before_cursor();
                 if !self.input.starts_with('/') {
                     self.menu_selected = None;
                 }
                 Action::None
             }
             (_, KeyCode::Enter) => {
-                let line = std::mem::take(&mut self.input);
+                let line = self.take_input();
                 self.menu_selected = None;
                 if line == ":quit" {
                     return Action::Quit;
@@ -310,7 +358,28 @@ impl App {
                 Action::Submit(line)
             }
             (_, KeyCode::Backspace) => {
-                self.input.pop();
+                self.delete_before_cursor();
+                Action::None
+            }
+            // Arrow keys move the edit cursor within the input line; the
+            // slash menu navigates with Up/Down only, so Left/Right stay
+            // free for text editing even while the menu is open.
+            (_, KeyCode::Left) => {
+                self.cursor_left();
+                Action::None
+            }
+            (_, KeyCode::Right) => {
+                self.cursor_right();
+                Action::None
+            }
+            // Home/End jump to the line boundaries (readline parity:
+            // without them a multi-line typo fix means holding an arrow).
+            (_, KeyCode::Home) => {
+                self.cursor = 0;
+                Action::None
+            }
+            (_, KeyCode::End) => {
+                self.cursor = self.input.len();
                 Action::None
             }
             // PageUp/PageDown scroll the transcript away from the tail;
@@ -330,7 +399,7 @@ impl App {
                 }
             },
             (_, KeyCode::Char(ch)) => {
-                self.input.push(ch);
+                self.insert_char(ch);
                 Action::None
             }
             _ => Action::None,
@@ -367,19 +436,72 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = transcript_lines(app);
-    // Follow mode (no manual scroll): offset = lines - height, so the last
-    // line sits at the pane bottom. NOT `u16::MAX` — ratatui 0.30 with
-    // `Wrap` walks `next_line()` per offset row and early-returns once past
-    // the content, so an oversized offset renders an EMPTY pane (the bug
-    // this fixes: the transcript never appeared). Clamping to the real
-    // count keeps follow mode correct for any content size.
-    let line_count = lines.len().min(u16::MAX as usize) as u16;
-    let offset = app.scroll.unwrap_or(line_count.saturating_sub(area.height));
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((offset, 0));
+    let logical = transcript_lines(app);
+    // Hard-wrap BEFORE rendering: the scroll offset counts VISUAL rows, and
+    // the widget's own word-wrap would produce more rows than we count —
+    // follow mode would stop short of the true bottom and the newest line
+    // (the `[EndTurn]` marker, streamed tail) would sit below the pane,
+    // invisible. Pre-wrapping here makes the row count exact, so offset
+    // `visual_count - height` always lands on the real end. The Paragraph
+    // therefore renders without `Wrap` — content is already wrapped.
+    let lines = wrap_lines(logical, area.width);
+    // Follow mode (no manual scroll): offset = visual_rows - height, so the
+    // last row sits at the pane bottom. NOT `u16::MAX` — ratatui 0.30 walks
+    // `next_line()` per offset row and early-returns once past the content,
+    // so an oversized offset renders an EMPTY pane (an earlier regression).
+    // Clamping to the real count keeps follow mode correct for any size.
+    let row_count = lines.len().min(u16::MAX as usize) as u16;
+    let offset = app.scroll.unwrap_or(row_count.saturating_sub(area.height));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Hard-wraps logical lines into visual rows of at most `width` cells
+/// (char-count based, no word breaking): splitting is deterministic, so
+/// the row count the scroll offset uses is the row count rendered. Wide
+/// (CJK) glyphs count as one cell here — the wrap point can then exceed
+/// the pane by a cell on such lines, an accepted approximation (the
+/// alternative is unicode-width, another dependency for one call site).
+fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let width = width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+
+    // Closes the row under construction. `current` is taken even when
+    // empty: an empty logical line must still occupy one visual row, or
+    // paragraph spacing collapses and the offset drifts again.
+    fn flush(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>, used: &mut usize) {
+        out.push(Line::from(std::mem::take(current)));
+        *used = 0;
+    }
+
+    for line in lines {
+        for span in line.spans {
+            let style = span.style;
+            for ch in span.content.chars() {
+                if used == width {
+                    flush(&mut out, &mut current, &mut used);
+                }
+                match current.last_mut() {
+                    // Adjacent runs of the same style merge back into one
+                    // span, keeping the row list small on long paragraphs.
+                    // `Cow::to_mut` materializes the borrowed string once;
+                    // further pushes then hit the owned buffer.
+                    Some(last) if last.style == style => {
+                        last.content.to_mut().push(ch);
+                    }
+                    _ => current.push(Span::styled(ch.to_string(), style)),
+                }
+                used += 1;
+            }
+        }
+        flush(&mut out, &mut current, &mut used);
+    }
+    out
 }
 
 fn transcript_lines(app: &App) -> Vec<Line<'static>> {
@@ -453,19 +575,32 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
-    let line = Line::from(vec![
-        Span::styled("you: ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            if blocked {
-                String::new()
-            } else {
-                app.input.clone()
-            },
-            style,
-        ),
-        Span::styled("▏", Style::default().fg(Color::Cyan)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let mut spans = vec![Span::styled("you: ", Style::default().fg(Color::Cyan))];
+    if blocked {
+        // The modal owns the keyboard; no edit cursor is shown.
+        spans.push(Span::styled(String::new(), style));
+    } else {
+        // The cursor is drawn at its true position: reversed highlight on
+        // the char under it, or a caret block past the end of the line.
+        let cursor = app.cursor.min(app.input.len());
+        spans.push(Span::styled(app.input[..cursor].to_string(), style));
+        match app.input[cursor..].chars().next() {
+            Some(ch) => {
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    style.add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::styled(
+                    app.input[cursor + ch.len_utf8()..].to_string(),
+                    style,
+                ));
+            }
+            None => {
+                spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
@@ -580,8 +715,132 @@ fn render_modal(frame: &mut Frame, question: &PermissionQuestion, area: Rect) {
         "{}\n\n[y] allow   [n] reject   [Esc] cancel",
         question.title()
     );
-    frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: true }),
-        box_area,
-    );
+    frame.render_widget(Paragraph::new(body).block(block), box_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn left_right_move_cursor_within_input() {
+        let mut app = App::default();
+        for ch in "abc".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor, 3);
+
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, 1);
+
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.input, "aXbc");
+        assert_eq!(app.cursor, 2);
+
+        // Clamped at both ends: no panic, no wraparound.
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, 0);
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn backspace_deletes_before_cursor() {
+        let mut app = App::default();
+        for ch in "ab".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "b");
+        assert_eq!(app.cursor, 0);
+        // At the start of the line Backspace is a no-op.
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "b");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn cursor_is_multibyte_safe() {
+        let mut app = App::default();
+        for ch in "абв".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.cursor, 6); // 3 chars × 2 bytes
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.cursor, 4);
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "ав");
+        assert_eq!(app.cursor, 2);
+        app.on_key(key(KeyCode::Char('ы')));
+        assert_eq!(app.input, "аыв");
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn submit_resets_cursor_with_buffer() {
+        let mut app = App::default();
+        for ch in "hi".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        app.on_key(key(KeyCode::Left));
+        match app.on_key(key(KeyCode::Enter)) {
+            Action::Submit(line) => assert_eq!(line, "hi"),
+            _ => panic!("expected Submit"),
+        }
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn home_end_jump_to_boundaries() {
+        let mut app = App::default();
+        for ch in "xyz".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.cursor, 0);
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.input, "axyz");
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn wrap_lines_respects_width_and_preserves_styles() {
+        let logical = vec![Line::from(Span::styled(
+            "abcdefghij",
+            Style::default().fg(Color::Cyan),
+        ))];
+        let rows = wrap_lines(logical, 4);
+        assert_eq!(rows.len(), 3, "10 cells into width 4 wraps to 3 rows");
+        let text: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(text, "abcdefghij");
+        // Style survives the split: every fragment keeps the color.
+        assert!(
+            rows.iter()
+                .all(|l| l.spans.iter().all(|s| s.style.fg == Some(Color::Cyan)))
+        );
+    }
+
+    #[test]
+    fn wrap_lines_keeps_empty_lines_as_rows() {
+        let logical = vec![Line::from("first"), Line::from(""), Line::from("third")];
+        let rows = wrap_lines(logical, 10);
+        assert_eq!(rows.len(), 3, "an empty logical line is one visual row");
+    }
 }

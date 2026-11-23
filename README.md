@@ -198,3 +198,14 @@ All outbound HTTP goes through [hclient](https://github.com/GamePad64/hclient) â
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Working directory
+
+The session's working directory is the first line of every system prompt:
+
+```
+Working directory: /path/to/project
+Tool calls and relative paths resolve against this directory.
+```
+
+The directory is the one the client declares at `newSession`/`loadSession` (`req.cwd`), not wherever `buran serve` was launched â€” so sessions in different directories each announce their own. ACP requires `loadSession` in the session's original directory (cwd mismatch is rejected), keeping the injected cwd and the transcript head consistent.

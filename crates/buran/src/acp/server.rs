@@ -270,10 +270,6 @@ fn build_agent(
                 // The ACP session id IS the transcript filename stem (the
                 // store's uuidv7), so `loadSession` finds the transcript
                 // under the id the client already knows. Degraded sessions
-                // (no transcript) get a bare uuidv7.
-                // The ACP session id IS the transcript filename stem (the
-                // store's uuidv7), so `loadSession` finds the transcript
-                // under the id the client already knows. Degraded sessions
                 // (no transcript) get a bare uuidv7. The id is captured
                 // before `spawn_writer` consumes the file.
                 let session_id = match &created_file {
@@ -1187,18 +1183,30 @@ fn turn_counter() -> u64 {
     TURN.fetch_add(1, Ordering::Relaxed)
 }
 
-/// System prompt = AGENTS.md instructions + skills description block.
+/// System prompt = working directory + AGENTS.md instructions + skills
+/// description block.
+///
+/// The working directory line comes FIRST so the model always knows where
+/// relative paths in AGENTS.md instructions and tool calls resolve to.
+/// The cwd is the client-declared session directory (`NewSessionRequest.cwd`
+/// / `LoadSessionRequest.cwd`), not wherever `buran serve` was launched —
+/// one process can serve sessions in different directories.
 fn build_system_prompt(
     project_dir: &std::path::Path,
     skills_dirs: &[std::path::PathBuf],
     instruction_files: &[String],
 ) -> String {
-    let agentsmd =
-        crate::agentsmd::load_system_instructions_with(Some(project_dir), instruction_files);
+    let mut prompt = format!(
+        "Working directory: {}\nTool calls and relative paths resolve against this directory.\n\n",
+        project_dir.display()
+    );
+    prompt.push_str(&crate::agentsmd::load_system_instructions_with(
+        Some(project_dir),
+        instruction_files,
+    ));
     let skills = crate::skills::scan(skills_dirs);
-    let mut prompt = agentsmd;
     if !skills.is_empty() {
-        if !prompt.is_empty() {
+        if !prompt.trim().is_empty() {
             prompt.push('\n');
         }
         prompt.push_str("## Available skills\n");
@@ -1358,4 +1366,39 @@ pub async fn serve_listen_with(
         }
     });
     Ok(bound)
+}
+
+#[cfg(test)]
+mod cwd_prompt_tests {
+    use super::build_system_prompt;
+
+    /// The cwd line is the FIRST line of the system prompt: the model must
+    /// know where it is working before reading any project instructions.
+    #[test]
+    fn system_prompt_starts_with_working_directory() {
+        let prompt = build_system_prompt(
+            std::path::Path::new("/mnt/devenv/workspace/buran"),
+            &[],
+            &["AGENTS.md".to_string()],
+        );
+        let first = prompt.lines().next().expect("prompt is not empty");
+        assert_eq!(
+            first, "Working directory: /mnt/devenv/workspace/buran",
+            "cwd must be the first line of the system prompt"
+        );
+        assert!(
+            prompt.contains("Tool calls and relative paths resolve against this directory."),
+            "the cwd line must explain path resolution"
+        );
+    }
+
+    #[test]
+    fn cwd_line_survives_missing_agentsmd_and_skills() {
+        let prompt = build_system_prompt(
+            std::path::Path::new("/tmp/nowhere"),
+            &[],                             // no skill dirs
+            &["NONEXISTENT.md".to_string()], // no instruction files
+        );
+        assert!(prompt.starts_with("Working directory: /tmp/nowhere"));
+    }
 }

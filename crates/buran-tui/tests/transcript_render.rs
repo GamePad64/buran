@@ -77,3 +77,45 @@ fn long_transcript_follow_mode_shows_the_last_line() {
         "the oldest line must have scrolled off; got:\n{screen}"
     );
 }
+
+/// Regression: follow mode must reach the TRUE bottom of the transcript —
+/// including wrapped rows. The transcript used ratatui's own `Wrap` while
+/// the scroll offset counted only logical lines; a long streamed reply
+/// wraps into more visual rows than were counted, so follow mode stopped
+/// short and the tail (`[EndTurn]`, the newest text) sat below the pane,
+/// invisible. Fix: hard-wrap before rendering so offset rows == visual
+/// rows exactly.
+#[test]
+fn follow_mode_reaches_the_bottom_of_wrapped_content() {
+    // One long assistant reply that wraps far past a 40x8 transcript pane.
+    let long_line = "x".repeat(200);
+    let mut app = App::default();
+    app.entries.push(Entry::Assistant(long_line.clone()));
+    app.entries.push(Entry::Assistant("[EndTurn]".into()));
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
+    terminal
+        .draw(|frame| buran_tui::ui::draw(frame, &mut app))
+        .expect("draw");
+
+    let backend = terminal.backend();
+    let screen: String = (0..10)
+        .map(|y| {
+            (0..40)
+                .map(|x| {
+                    backend
+                        .buffer()
+                        .cell((x, y))
+                        .map(|c| c.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        screen.contains("[EndTurn]"),
+        "follow mode must show the turn-end marker on a wrapped transcript; got:\n{screen}"
+    );
+}
