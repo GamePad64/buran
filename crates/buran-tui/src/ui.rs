@@ -19,6 +19,12 @@ pub enum Entry {
     Assistant(String),
     /// A permission decision the user made on a tool call.
     Permission { title: String, outcome: String },
+    /// A tool call the agent made (transparency for allow_all: no modal
+    /// asks, so the transcript is the only place the calls are visible).
+    ToolCall {
+        title: String,
+        status: Option<String>,
+    },
 }
 
 /// What a key press means to the app loop.
@@ -112,6 +118,42 @@ impl App {
         match self.entries.last_mut() {
             Some(Entry::Assistant(text)) => text.push_str(chunk),
             _ => self.entries.push(Entry::Assistant(chunk.to_string())),
+        }
+        self.scroll = None;
+    }
+
+    /// Adds/updates a tool-call entry: a fresh entry on start, status
+    /// appended to the LAST matching entry on completion.
+    pub fn push_tool_call(&mut self, title: &str, status: Option<String>) {
+        match status {
+            None => {
+                self.entries.push(Entry::ToolCall {
+                    title: title.to_string(),
+                    status: None,
+                });
+            }
+            Some(status) => {
+                // Find the last matching open entry (matching by title is
+                // enough for v1: parallel same-name calls render as one).
+                for entry in self.entries.iter_mut().rev() {
+                    if let Entry::ToolCall {
+                        title: t,
+                        status: s,
+                    } = entry
+                        && t == title
+                        && s.is_none()
+                    {
+                        *s = Some(status);
+                        self.scroll = None;
+                        return;
+                    }
+                }
+                // No open entry (out-of-order update): append as resolved.
+                self.entries.push(Entry::ToolCall {
+                    title: title.to_string(),
+                    status: Some(status),
+                });
+            }
         }
         self.scroll = None;
     }
@@ -352,6 +394,16 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
                 for line in text.lines() {
                     lines.push(Line::from(Span::raw(line.to_string())));
                 }
+            }
+            Entry::ToolCall { title, status } => {
+                let suffix = match status {
+                    Some(s) => format!(" [{s}]"),
+                    None => " [running]".to_string(),
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("tool > {title}{suffix}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
             Entry::Permission { title, outcome } => {
                 let color = match outcome.as_str() {

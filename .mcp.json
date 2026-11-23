@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "act-filesystem": {
+      "type": "stdio",
+      "command": "act",
+      "args": ["run", "--mcp", "oci://actpkg.dev/library/filesystem", "--allow", "fs"]
+    }
+  }
+}

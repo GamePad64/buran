@@ -372,3 +372,76 @@ async fn resume_latest_with_empty_store_fails_loudly() {
         }
     }
 }
+
+mod tool_call_visibility {
+    //! Tool-call transparency (ADR 0012 sibling): under allow_all no modal
+    //! asks — tool_call notifications surface as events so the transcript
+    //! shows what the agent did.
+
+    use super::*;
+    use agent_client_protocol::v1::schema::SessionUpdate;
+
+    fn fake_agent_with_tool_call() -> String {
+        r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"sessionId":"fake-session-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc1","title":"read config","name":"fs__read"}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc1","status":"completed"}}}\n'
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn tool_call_notifications_surface_as_events() {
+        let client = AcpClient::spawn(
+            &format!("bash -c {}", shell_quote(&fake_agent_with_tool_call())),
+            None,
+            None,
+        )
+        .await
+        .expect("spawn");
+
+        let mut turn = client.prompt_detached("go".into());
+        let mut started = None;
+        let mut finished = None;
+        for _ in 0..6 {
+            let event = tokio::time::timeout(TIMEOUT, client.next_event())
+                .await
+                .expect("event timed out")
+                .expect("connection closed");
+            match event {
+                ClientEvent::ToolCallStarted { title } => started = Some(title),
+                ClientEvent::ToolCallFinished { status, .. } => finished = Some(status),
+                _ => {}
+            }
+            if started.is_some() && finished.is_some() {
+                break;
+            }
+        }
+        let _ = turn.stop_reason().await;
+
+        assert_eq!(
+            started.as_deref(),
+            Some("read config"),
+            "started title surfaces: {started:?}"
+        );
+        assert_eq!(
+            finished.as_deref(),
+            Some("completed"),
+            "finish status surfaces: {finished:?}"
+        );
+        client.shutdown();
+    }
+}

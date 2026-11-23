@@ -143,6 +143,16 @@ async fn run_app(
                         .collect();
                     Step::Continue
                 }
+                // Tool-call transparency (ADR 0012 sibling): under
+                // allow_all no modal asks — the transcript shows calls.
+                Some(ClientEvent::ToolCallStarted { title }) => {
+                    app.push_tool_call(&title, None);
+                    Step::Continue
+                }
+                Some(ClientEvent::ToolCallFinished { call_id, status }) => {
+                    app.push_tool_call(&call_id, Some(status));
+                    Step::Continue
+                }
                 // Agent connection closed: exit cleanly.
                 None => Step::Quit,
             },

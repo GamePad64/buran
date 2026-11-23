@@ -99,6 +99,23 @@ Symlinks resolve (a `CLAUDE.md -> AGENTS.md` twin loads once, at the nearest pos
 
 On first run, `buran doctor` detects an empty MCP configuration and offers **ACT** (MCP-over-stdio) as the ready-made tool set — including its filesystem component, which is the way buran gets file tools (there is no bundled fs server; all tools are external, by design). The offer prints the ready-to-paste config line; the harness itself has no ACT-specific code.
 
+**Trusting ACT fully (no prompts on either level).** Permissions exist on both levels: buran asks per tool call (`[permissions] policy`), and ACT asks at component spawn (its `ask` default). To grant everything:
+
+```toml
+# buran side — ~/.config/buran/config.toml or buran.config.toml
+[permissions]
+policy = "allow_all"
+```
+
+```toml
+# ACT side — ~/.config/act/config.toml (read by act-cli automatically)
+[policy."wasi:filesystem"]
+mode = "allowlist"
+allow = [{ path = "**", mode = "rw" }]
+```
+
+With both, `--allow fs` in `.mcp.json` becomes optional (the grant arrives from the profile). To narrow instead of open: `path = "/work/**"`, and buran's `[permissions] policy = "ask"` keeps per-call prompts.
+
 ## Hooks (v2.1)
 
 User-configurable reactions to harness events — the logic lives entirely outside the binary (ADR 0012):

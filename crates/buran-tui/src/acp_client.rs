@@ -125,6 +125,12 @@ pub enum ClientEvent {
     /// UI stores it for the completion menu. A client that never gets
     /// this (older agent) simply has no menu.
     Commands(Vec<AvailableCommand>),
+    /// A tool call started (name = display title): visibility for
+    /// `allow_all` policies where no permission modal asks (ADR 0012
+    /// sibling need — transparency replaces the modal).
+    ToolCallStarted { title: String },
+    /// A tool call resolved: status is "completed" or "failed".
+    ToolCallFinished { call_id: String, status: String },
 }
 
 /// How long the permission handler waits for the UI answer before
@@ -311,6 +317,33 @@ impl AcpClient {
                             SessionUpdate::AvailableCommandsUpdate(update) => {
                                 let _ = event_tx_chunk
                                     .send(ClientEvent::Commands(update.available_commands))
+                                    .await;
+                            }
+                            SessionUpdate::ToolCall(call) => {
+                                let _ = event_tx_chunk
+                                    .send(ClientEvent::ToolCallStarted {
+                                        title: if call.title.is_empty() {
+                                            call.name.clone().unwrap_or_else(|| "tool".into())
+                                        } else {
+                                            call.title.clone()
+                                        },
+                                    })
+                                    .await;
+                            }
+                            SessionUpdate::ToolCallUpdate(update) => {
+                                // The protocol puts `status` FLAT next to
+                                // `toolCallId`; SDK-emitted updates nest it
+                                // in `fields` — accept both shapes.
+                                let status = update
+                                    .fields
+                                    .status
+                                    .map(|s| format!("{s:?}").to_lowercase())
+                                    .unwrap_or_default();
+                                let _ = event_tx_chunk
+                                    .send(ClientEvent::ToolCallFinished {
+                                        call_id: update.tool_call_id.0.to_string(),
+                                        status,
+                                    })
                                     .await;
                             }
                             _ => {}
