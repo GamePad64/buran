@@ -27,6 +27,7 @@ itertools.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
 toml_edit.workspace = true
+dirs.workspace = true
 tracing-appender.workspace = true
 
 [dev-dependencies]

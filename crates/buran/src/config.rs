@@ -392,6 +392,10 @@ impl Config {
         let mut seen_provider = false;
 
         if let Some(home) = home.as_deref() {
+            // Keep the `$HOME`-relative XDG shape on every platform: the
+            // injected `home_reader` is the test seam, and a `dirs` call
+            // here would ignore it (tests fixturing a fake HOME would
+            // silently read the real one).
             let global = Path::new(home).join(".config/buran/config.toml");
             if global.is_file() {
                 let file = read_config_file(&global)?;

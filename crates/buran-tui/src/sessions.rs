@@ -114,8 +114,13 @@ pub fn catalog(root: &Path, here: &Path) -> PickerCatalog {
 /// function is duplicated here because `main.rs`'s module tree is the
 /// binary's, and the picker is driven from there).
 pub fn store_root() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join(".local/state/buran/sessions")
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::Path::new(&home).join(".local/state")
+        })
+        .join("buran/sessions")
 }
 
 /// Head metadata plus the first user message, scanning at most a few

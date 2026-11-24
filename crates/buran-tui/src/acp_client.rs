@@ -169,8 +169,13 @@ pub fn serve_args(resume: Option<String>, fork: Option<String>) -> Vec<String> {
 /// max-filename listing sees exactly the store the agent sees. Cross-machine
 /// resume (remote agent, separate store) is a spec non-goal.
 fn store_root() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join(".local/state/buran/sessions")
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::Path::new(&home).join(".local/state")
+        })
+        .join("buran/sessions")
 }
 
 /// Max `.jsonl` stem in the sessions store — the `Store::latest` rule

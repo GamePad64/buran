@@ -9,7 +9,7 @@ pub use writer::{StoreCmd, WriterHandle};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::session::{TranscriptMeta, TranscriptRecord};
 
@@ -67,10 +67,19 @@ impl Store {
         Self { root: root.into() }
     }
 
-    /// `$HOME/.local/state/buran/sessions` — XDG state home, per spec.
+    /// XDG state home + `buran/sessions` — via `dirs`, so non-Linux
+    /// platforms get their native state dir for free.
     pub fn default_root() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        Path::new(&home).join(".local/state/buran/sessions")
+        dirs::state_dir()
+            // A missing XDG state dir is a platform oddity, not a hard
+            // failure: fall back to the data dir, then the data-center
+            // standard `$HOME/.local/state` shape.
+            .or_else(dirs::data_dir)
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::path::Path::new(&home).join(".local/state")
+            })
+            .join("buran/sessions")
     }
 
     fn path_for(&self, id: &str) -> PathBuf {

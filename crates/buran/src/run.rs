@@ -180,8 +180,9 @@ pub async fn doctor() -> Result<()> {
 /// plain `toml` serializer would rewrite the whole document). Idempotent:
 /// an `act-fs` entry already present is a no-op.
 pub fn doctor_add_act() -> Result<()> {
-    let path = std::env::var("HOME")
-        .map(|home| std::path::PathBuf::from(home).join(".config/buran/config.toml"))?;
+    let path = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the user config dir"))?
+        .join("buran/config.toml");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
