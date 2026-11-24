@@ -16,8 +16,9 @@
 //! Unreadable layers are skipped with a debug log — a broken instruction
 //! file must never crash the server.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use itertools::Itertools as _;
 
 /// Default searched names (ADR 0003).
 pub const DEFAULT_FILES: &[&str] = &["AGENTS.md"];
@@ -60,11 +61,11 @@ pub fn load_system_instructions_with(project_dir: Option<&Path>, names: &[String
     }
 
     // Phase 3: dedup keeping FIRST occurrence — a symlink twin loads once,
-    // at the symlink's position.
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    // at the symlink's position. `unique()` is global first-wins, same
+    // contract the HashSet version had, without the manual insert-filter.
     let texts: Vec<String> = canonical
         .into_iter()
-        .filter(|real| seen.insert(real.clone()))
+        .unique()
         .filter_map(|real| {
             std::fs::read_to_string(&real)
                 .map_err(|source| {
@@ -79,7 +80,7 @@ pub fn load_system_instructions_with(project_dir: Option<&Path>, names: &[String
 
     let joined = texts.join("\n\n");
     tracing::debug!(
-        files = seen.len(),
+        files = texts.len(),
         bytes = joined.len(),
         "loaded instruction files"
     );

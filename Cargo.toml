@@ -18,6 +18,14 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
+jiff = { version = "1.0.2", features = ["serde"] }
+itertools = "0.15.0"
+futures = "0.3"
+toml_edit = "0.23"
+tokio-util = { version = "0.7", features = ["io"] }
+tracing-appender = "0.2"
+assert_cmd = "2"
+predicates = "3"
 agent-client-protocol-http = { version = "5", default-features = false, features = ["server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 

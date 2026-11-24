@@ -52,7 +52,13 @@ enum Command {
         subagent_provider: Option<String>,
     },
     /// Probe config and MCP servers, offer ACT on first run
-    Doctor,
+    Doctor {
+        /// Write the ACT filesystem server into the global config.toml
+        /// ([mcp_servers] section) instead of only printing the snippet.
+        /// Comment- and format-preserving (toml_edit).
+        #[arg(long)]
+        add_act: bool,
+    },
     /// Run the delegation MCP server (ADR 0011): spawn/wait for child
     /// buran agents. Registered as an MCP server in .mcp.json.
     Subagents,
@@ -107,7 +113,10 @@ fn main() -> anyhow::Result<()> {
             subagent_of,
             subagent_provider,
         ),
-        Command::Doctor => {
+        Command::Doctor { add_act } => {
+            if add_act {
+                buran::run::doctor_add_act()?;
+            }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;

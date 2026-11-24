@@ -107,7 +107,7 @@ async fn full_turn_text_tool_then_final_text() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
 
     // Server-side watcher: answers permission queries found in events, and
     // records the full event sequence for assertions.
@@ -176,7 +176,7 @@ async fn denied_tool_never_calls_backend() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
 
     // Server-side watcher: deny every query seen in the event stream.
     let answer = tokio::spawn(async move {
@@ -224,13 +224,14 @@ async fn cancel_stops_turn_gracefully() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_tx = tokio_util::sync::CancellationToken::new();
+    let cancel_rx = cancel_tx.child_token();
 
     // Fire cancel when the first delta arrives.
     let watcher = tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
             if matches!(ev, TurnEvent::TextDelta(_)) {
-                let _ = cancel_tx.send(true);
+                cancel_tx.cancel();
             }
         }
     });
@@ -275,7 +276,7 @@ async fn usage_on_final_chunk_reaches_turn_summary() {
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
     drop(events_rx);
 
     let summary = loop_
@@ -305,7 +306,7 @@ async fn no_usage_chunk_leaves_summary_usage_none() {
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
     drop(events_rx);
 
     let summary = loop_
@@ -342,7 +343,7 @@ async fn same_tool_streak_guard_cuts_after_n_identical_rounds() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
 
     // Auto-allow everything so the only thing that can stop the turn is
     // the guard.
@@ -400,7 +401,7 @@ async fn streak_guard_threshold_is_configurable() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
 
     let answer = tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
@@ -465,7 +466,7 @@ async fn streak_guard_ignores_tool_calls_with_differing_args() {
     let mut session = SessionState::default();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel_rx = tokio_util::sync::CancellationToken::new();
     let answer = tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
             if let TurnEvent::PermissionQuery(_) = &ev {
@@ -525,7 +526,7 @@ mod hooks_tests {
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx = tokio_util::sync::CancellationToken::new();
         let answerer = tokio::spawn(async move {
             while let Some(ev) = events_rx.recv().await {
                 if let TurnEvent::PermissionQuery(_) = &ev {
@@ -615,7 +616,7 @@ mod on_turn_end_tests {
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx = tokio_util::sync::CancellationToken::new();
         let answerer = tokio::spawn(async move {
             while let Some(ev) = events_rx.recv().await {
                 if let TurnEvent::PermissionQuery(_) = &ev {
@@ -654,7 +655,7 @@ mod on_turn_end_tests {
         let m2 = m.clone();
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx = tokio_util::sync::CancellationToken::new();
         let answerer = tokio::spawn(async move {
             while let Some(ev) = events_rx.recv().await {
                 if let TurnEvent::PermissionQuery(_) = &ev {
@@ -723,7 +724,7 @@ mod hooks_edge_tests {
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
         let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx = tokio_util::sync::CancellationToken::new();
         let answerer = tokio::spawn(async move {
             while let Some(ev) = events_rx.recv().await {
                 if let TurnEvent::PermissionQuery(_) = &ev {

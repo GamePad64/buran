@@ -21,7 +21,8 @@ use agent_client_protocol::{
         ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     },
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::compact::summarizer::Summarizer as _;
 use crate::config::{Config, PermissionPolicy, ProviderConfig};
@@ -38,7 +39,7 @@ struct SessionHandle {
     system_prompt: String,
     skills: Vec<crate::skills::SkillDescription>,
     session: SessionState,
-    cancel_tx: watch::Sender<bool>,
+    cancel_tx: CancellationToken,
     /// Handle to this session's store-writer task (owns the transcript
     /// file; hardening v1.5.1 Task 13). `None` when the store refused the
     /// file at `newSession` time (persistence degrades, the session still
@@ -237,7 +238,7 @@ fn build_agent(
                     &state_new_session.config.agentsmd.files,
                 );
                 let skills = crate::skills::scan(&state_new_session.config.skills_dirs);
-                let (cancel_tx, _) = watch::channel(false);
+                let cancel_tx = CancellationToken::new();
                 // Transcript head: model/provider/cwd pin the session's
                 // identity for `loadSession` later (sessions store spec).
                 // Persistence degrades to pre-v1.5 behavior on failure: the
@@ -368,7 +369,7 @@ fn build_agent(
                             compaction_points,
                             compaction_summaries,
                         },
-                        cancel_tx: watch::channel(false).0,
+                        cancel_tx: CancellationToken::new(),
                         turn_in_flight: false,
                         // The writer task owns the reopened file from here
                         // on (hardening v1.5.1 Task 13).
@@ -541,7 +542,7 @@ fn build_agent(
                     .expect("sessions lock")
                     .get(&notif.session_id)
                 {
-                    let _ = handle.cancel_tx.send(true);
+                    handle.cancel_tx.cancel();
                 }
                 Ok(())
             },
@@ -731,7 +732,7 @@ async fn run_prompt_turn(
         }
         handle.turn_in_flight = true;
         let starting_history_len = handle.session.history.len();
-        let cancel_rx = handle.cancel_tx.subscribe();
+        let cancel_rx = handle.cancel_tx.child_token();
         (
             starting_history_len,
             std::mem::take(&mut handle.session),
@@ -966,7 +967,7 @@ struct TurnContext {
     session: SessionState,
     system_prompt: String,
     skills: Vec<crate::skills::SkillDescription>,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel_rx: CancellationToken,
 }
 
 /// Builds a TurnContext for the overflow-retry path: the failed pass's
@@ -986,7 +987,7 @@ fn build_turn_context(
         session: std::mem::take(&mut handle.session),
         system_prompt: handle.system_prompt.clone(),
         skills: handle.skills.clone(),
-        cancel_rx: handle.cancel_tx.subscribe(),
+        cancel_rx: handle.cancel_tx.child_token(),
     })
 }
 
@@ -1004,7 +1005,7 @@ async fn run_prompt_turn_inner(
         mut session,
         system_prompt,
         skills,
-        mut cancel_rx,
+        cancel_rx,
     } = turn;
     let llm = (state.llm_factory)(provider)?;
     let catalog = state.mcp.catalog().await;
@@ -1136,7 +1137,7 @@ async fn run_prompt_turn_inner(
 
     // A requested cancel wins over the loop's finish reason: the protocol
     // REQUIRES Cancelled after session/cancel.
-    let cancelled = *cancel_rx.borrow_and_update();
+    let cancelled = cancel_rx.is_cancelled();
     let stop = if cancelled {
         StopReason::Cancelled
     } else {
@@ -1268,12 +1269,30 @@ pub fn new_session_id_for_test() -> String {
     new_session_id()
 }
 
-/// Production entry: real serve on stdio. Logs go to stderr only — stdout
-/// is the ACP JSON-RPC channel and must stay clean.
+/// Production entry: real serve on stdio. Logs go to stderr AND a daily
+/// rolling file under the XDG state dir — stdout is the ACP JSON-RPC
+/// channel and must stay clean. The file side survives the process: a
+/// session that crashed mid-turn leaves a readable trace for the doctor.
 pub fn serve() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let file_log = tracing_appender::rolling::daily(
+        crate::store::Store::default_root()
+            .parent()
+            .unwrap_or(&std::env::temp_dir()),
+        "buran.log",
+    );
+    // Stderr copy: the rolling writer only owns the file. The guard is
+    // leaked — it must live for the whole process; dropping it would
+    // truncate buffered lines.
+    let (file_writer, _guard) = tracing_appender::non_blocking(file_log);
+    std::mem::forget(_guard);
+    // Two layered fmt subscribers — stderr + rolling file — under one
+    // registry: a second global `.init()` would silently no-op.
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(tracing_subscriber::fmt::layer().with_writer(file_writer))
         .init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()

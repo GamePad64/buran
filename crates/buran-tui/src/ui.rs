@@ -630,13 +630,7 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
     }
     for (i, row) in picker.rows.iter().enumerate() {
         let marker = if i == picker.selected { " > " } else { "   " };
-        let age = crate::sessions::relative_age(
-            &row.started_at,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
+        let age = crate::sessions::relative_age(&row.started_at, jiff::Timestamp::now());
         // cwd shortened to its last component: the picker is filtered to
         // one directory anyway, and the full path eats the title.
         let dir = row

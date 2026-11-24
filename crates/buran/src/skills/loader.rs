@@ -24,7 +24,7 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<SkillDescription> {
             found.push(skill);
         }
     }
-    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found.sort_by_key(|s| s.name.clone());
     found
 }
 

@@ -51,14 +51,14 @@ pub fn session_title(raw: &str, max: usize) -> String {
 /// "12m", "3h", "2d", "4w" — coarse on purpose: the picker is for
 /// recognition, not timestamps. Future or unparseable stamps render as
 /// the raw string rather than a wrong age.
-pub fn relative_age(started_at: &str, now_unix: u64) -> String {
-    let Some(then) = parse_rfc3339(started_at) else {
+pub fn relative_age(started_at: &str, now: jiff::Timestamp) -> String {
+    let Ok(then) = started_at.parse::<jiff::Timestamp>() else {
         return started_at.to_string();
     };
-    if then > now_unix {
+    if then > now {
         return started_at.to_string();
     }
-    let secs = now_unix - then;
+    let secs = now.duration_since(then).as_secs() as u64;
     let (n, unit) = if secs < 60 {
         (secs, "s")
     } else if secs < 3600 {
@@ -168,32 +168,6 @@ fn read_row(path: &Path, id: String) -> Option<SessionRow> {
     })
 }
 
-/// The timestamp shape buran writes (`YYYY-MM-DDTHH:MM:SSZ`), nothing else.
-fn parse_rfc3339(s: &str) -> Option<u64> {
-    if s.len() != 20 || !s.ends_with('Z') {
-        return None;
-    }
-    let b = s.as_bytes();
-    let year: i64 = std::str::from_utf8(&b[0..4]).ok()?.parse().ok()?;
-    let month: u32 = std::str::from_utf8(&b[5..7]).ok()?.parse().ok()?;
-    let day: u32 = std::str::from_utf8(&b[8..10]).ok()?.parse().ok()?;
-    let hour: u64 = std::str::from_utf8(&b[11..13]).ok()?.parse().ok()?;
-    let min: u64 = std::str::from_utf8(&b[14..16]).ok()?.parse().ok()?;
-    let sec: u64 = std::str::from_utf8(&b[17..19]).ok()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
-        return None;
-    }
-    // Days from civil (Howard Hinnant), inverse of `rfc3339_now`.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as u64;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
-    let days = (era * 146_097 + doe as i64 - 719_468) as u64;
-    Some(days * 86_400 + hour * 3600 + min * 60 + sec)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,10 +242,11 @@ mod tests {
     #[test]
     fn relative_age_buckets() {
         // 2026-11-12T00:00:00Z == a fixed instant; ages measured from it.
-        let t = parse_rfc3339("2026-11-12T00:00:00Z").unwrap();
-        assert_eq!(relative_age("2026-11-12T00:00:00Z", t + 90), "1m");
-        assert_eq!(relative_age("2026-11-12T00:00:00Z", t + 3 * 3600), "3h");
-        assert_eq!(relative_age("2026-11-12T00:00:00Z", t + 2 * 86_400), "2d");
+        let t: jiff::Timestamp = "2026-11-12T00:00:00Z".parse().unwrap();
+        let at = |secs: i64| t + jiff::SignedDuration::from_secs(secs);
+        assert_eq!(relative_age("2026-11-12T00:00:00Z", at(90)), "1m");
+        assert_eq!(relative_age("2026-11-12T00:00:00Z", at(3 * 3600)), "3h");
+        assert_eq!(relative_age("2026-11-12T00:00:00Z", at(2 * 86_400)), "2d");
         assert_eq!(relative_age("not a date", t), "not a date");
     }
 }

@@ -2,7 +2,7 @@
 //! final answer (ADR 0001).
 //!
 //! Events flow out through an `mpsc` channel; permission decisions flow in
-//! through another; a `watch` channel carries cancellation. Permission
+//! through another; a `CancellationToken` carries cancellation. Permission
 //! *queries* ride the events channel (`TurnEvent::PermissionQuery`) because
 //! the loop only holds the decision receiver — the server task watching the
 //! events applies the policy (or asks the ACP client) and sends the decision
@@ -11,11 +11,12 @@
 //! The loop owns no I/O beyond the LLM client and the `ToolCaller`.
 
 use std::collections::BTreeMap;
-use std::future::{Future, pending};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::client::{ChatEvent, LlmClient};
 use super::types::{
@@ -159,16 +160,13 @@ pub struct TurnSummary {
     pub usage: Option<Usage>,
 }
 
-/// Resolves once cancellation is requested; parks forever if the sender is
-/// gone (no further cancel can ever arrive).
-async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
-    loop {
-        if *cancel.borrow_and_update() {
-            return;
-        }
-        if cancel.changed().await.is_err() {
-            pending::<()>().await;
-        }
+/// Resolves once cancellation is requested; parks forever if all permits
+/// are gone (no further cancel can ever arrive). `CancellationToken` models
+/// this natively — the old hand-rolled `watch<bool>` loop was its
+/// reimplementation.
+async fn wait_for_cancel(cancel: &CancellationToken) {
+    if !cancel.is_cancelled() {
+        cancel.cancelled().await;
     }
 }
 
@@ -296,7 +294,7 @@ impl AgentLoop {
         user_text: &str,
         events: mpsc::Sender<TurnEvent>,
         permissions: mpsc::Receiver<PermissionDecision>,
-        cancel: watch::Receiver<bool>,
+        cancel: CancellationToken,
     ) -> Result<TurnSummary, super::LlmError> {
         let summary = self
             .run_turn_inner(session, user_text, events, permissions, cancel)
@@ -331,7 +329,7 @@ impl AgentLoop {
         user_text: &str,
         events: mpsc::Sender<TurnEvent>,
         mut permissions: mpsc::Receiver<PermissionDecision>,
-        mut cancel: watch::Receiver<bool>,
+        cancel: CancellationToken,
     ) -> Result<TurnSummary, super::LlmError> {
         session.history.push(ChatMessage::user(user_text));
 
@@ -348,7 +346,7 @@ impl AgentLoop {
         let mut first_assistant_message = true;
 
         for _round in 0..self.max_turns {
-            if *cancel.borrow_and_update() {
+            if cancel.is_cancelled() {
                 return Ok(TurnSummary {
                     finish: FinishReason::Stop,
                     tool_calls_made,
@@ -371,12 +369,12 @@ impl AgentLoop {
             };
 
             let (assistant_text, requested, round_finish, round_usage) =
-                self.stream_round(&req, &events, &mut cancel).await?;
+                self.stream_round(&req, &events, &cancel).await?;
             if round_usage.is_some() {
                 usage = round_usage;
             }
 
-            if *cancel.borrow_and_update() {
+            if cancel.is_cancelled() {
                 // Cancel fired mid-stream: keep any partial text, stop clean.
                 if !assistant_text.is_empty() {
                     session.history.push(ChatMessage::assistant(assistant_text));
@@ -472,7 +470,7 @@ impl AgentLoop {
                     .await;
 
                 let decision = self
-                    .ask_permission(call, &events, &mut permissions, &mut cancel)
+                    .ask_permission(call, &events, &mut permissions, &cancel)
                     .await;
                 let tool_message = match decision {
                     PermissionDecision::Deny => ChatMessage::tool(
@@ -632,7 +630,7 @@ impl AgentLoop {
         &self,
         req: &ChatRequest,
         events: &mpsc::Sender<TurnEvent>,
-        cancel: &mut watch::Receiver<bool>,
+        cancel: &CancellationToken,
     ) -> Result<
         (
             String,
@@ -706,7 +704,7 @@ impl AgentLoop {
         call: &ToolCallReq,
         events: &mpsc::Sender<TurnEvent>,
         permissions: &mut mpsc::Receiver<PermissionDecision>,
-        cancel: &mut watch::Receiver<bool>,
+        cancel: &CancellationToken,
     ) -> PermissionDecision {
         // Wire name `server__tool` → (server, tool) for the query.
         let (server, tool) = match call.function.name.split_once("__") {
@@ -746,9 +744,6 @@ fn canonical_args(arguments: &str) -> String {
 }
 
 fn nanos() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    let n = jiff::Timestamp::now().as_nanosecond();
+    if n < 0 { 0 } else { n as u64 }
 }

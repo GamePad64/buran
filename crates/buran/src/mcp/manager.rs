@@ -99,14 +99,22 @@ const RESTART_CAP: u32 = 3;
 
 impl McpManager {
     /// Spawns every server and performs the MCP handshake, each bounded by
-    /// `timeout`. Broken servers land in `failures()` as `(name, reason)`.
+    /// `timeout`. Spawns run CONCURRENTLY (`join_all`): a slow server must
+    /// not serialze the startup of the rest — startup cost is the max of
+    /// the handshakes, not their sum. Broken servers land in `failures()`
+    /// as `(name, reason)`.
     pub async fn start(configs: &[McpServerConfig], timeout: Duration) -> Result<Self, McpError> {
+        let results =
+            futures::future::join_all(configs.iter().map(|config| async move {
+                (config.name.clone(), start_one(config, timeout).await)
+            }))
+            .await;
+
         let mut clients = BTreeMap::new();
         let mut failures = Vec::new();
-
-        for config in configs {
-            let name = config.name.clone();
-            match start_one(config, timeout).await {
+        // Config order preserved: results come back in the input order.
+        for (name, result) in results {
+            match result {
                 Ok(client) => {
                     clients.insert(name, client);
                 }
